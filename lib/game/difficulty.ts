@@ -37,4 +37,14 @@ export const DIFFICULTIES: Record<Difficulty, DifficultyConfig> = {
     restartLevelOnHit: true, // any hit sends you back to the level start
     playerSpeedMul: 1.1,
   },
+  extreme: {
+    label: "Extreme",
+    lives: 1, // one hit ends the run — restartLevelOnHit is moot at 1 life
+    enemySpeedMul: 2.0, // mobs move twice as fast
+    coyoteMs: 40, // almost no ledge grace
+    jumpBufferMs: 50,
+    timeLimitSec: 45, // brutal clock
+    restartLevelOnHit: false,
+    playerSpeedMul: 1.15,
+  },
 };

@@ -10,6 +10,20 @@
 
 export type Rect = { x: number; y: number; w: number; h: number };
 
+/**
+ * Crusher vertical profile over one cycle. `t` in [0,1) → 0 (fully raised, the
+ * safe passing window) up to 1 (fully slammed). Raised for the first 55% of the
+ * cycle, a quick slam, a brief bottom hold, then a retract. The long raised
+ * window is what guarantees every crusher is passable — kept here (pure,
+ * DOM-free) so that guarantee is unit-testable.
+ */
+export function crusherOffset(t: number): number {
+  if (t < 0.55) return 0; // raised — safe to run under
+  if (t < 0.65) return (t - 0.55) / 0.1; // slam down
+  if (t < 0.8) return 1; // hold at the bottom
+  return 1 - (t - 0.8) / 0.2; // retract back up
+}
+
 /** Axis-aligned bounding-box overlap. Touching edges do NOT count as overlap. */
 export function aabb(a: Rect, b: Rect): boolean {
   return (

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aabb, moveAndCollide, type Rect } from "./physics";
+import { aabb, crusherOffset, moveAndCollide, type Rect } from "./physics";
 
 const floor: Rect = { x: 0, y: 100, w: 500, h: 40 };
 
@@ -44,5 +44,26 @@ describe("moveAndCollide", () => {
     const r = moveAndCollide(body, 0, 8, [plat]);
     expect(r.onGround).toBe(true);
     expect(r.y).toBe(80);
+  });
+});
+
+describe("crusherOffset", () => {
+  it("stays fully raised (0) for a contiguous window each cycle", () => {
+    // The raised window is what guarantees a crusher is always passable.
+    for (let t = 0; t < 0.55; t += 0.01) {
+      expect(crusherOffset(t), `t=${t.toFixed(2)}`).toBe(0);
+    }
+  });
+
+  it("reaches a full slam (1) during the bottom hold", () => {
+    expect(crusherOffset(0.7)).toBe(1);
+  });
+
+  it("never leaves the [0,1] range across a full cycle", () => {
+    for (let t = 0; t < 1; t += 0.005) {
+      const v = crusherOffset(t);
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
   });
 });

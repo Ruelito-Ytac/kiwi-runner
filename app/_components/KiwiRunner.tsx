@@ -37,6 +37,9 @@ const EMPTY_ASSETS: GameAssets = {
   cloudBig: null,
   cloudSmall: null,
   thorns: null,
+  floorStart: null,
+  floorMid: null,
+  floorEnd: null,
   platform: null,
 };
 
@@ -163,9 +166,10 @@ export function KiwiRunner() {
       setScreen("playing");
     });
 
+  // Game over = run over: restart the whole journey from Level 1.
   const retry = () =>
     withLock(() => {
-      gameRef.current?.retry();
+      gameRef.current?.startRun();
       setScreen("playing");
     });
 
@@ -190,6 +194,7 @@ export function KiwiRunner() {
     gameRef.current?.setMove(dir, on);
   const jump = (down: boolean) =>
     down ? gameRef.current?.jumpDown() : gameRef.current?.jumpUp();
+  const dash = () => gameRef.current?.dashDown();
 
   const playing =
     screen === "playing" || screen === "paused" || screen === "controls";
@@ -217,7 +222,7 @@ export function KiwiRunner() {
 
           {/* touch controls */}
           {screen === "playing" && isTouch && (
-            <TouchControls move={move} jump={jump} />
+            <TouchControls move={move} jump={jump} dash={dash} />
           )}
 
           {/* screens */}
@@ -294,7 +299,8 @@ export function KiwiRunner() {
               <h2 className="text-2xl font-black text-white">How to play</h2>
               <ul className="mt-4 space-y-1 text-center text-white/90">
                 <li>← → or A D — move</li>
-                <li>Space / ↑ / W — jump (hold for higher)</li>
+                <li>Space / ↑ / W — jump (hold higher, tap again to double-jump)</li>
+                <li>Shift / K — dash (a burst across gaps)</li>
                 <li>Esc — pause</li>
                 {isTouch && <li>On-screen buttons on touch devices</li>}
               </ul>
@@ -363,9 +369,12 @@ export function KiwiRunner() {
               <p className="mt-2 text-white/90">
                 Coins {summary.coins} · Score {summary.score}
               </p>
+              <p className="mt-1 text-sm text-white/70">
+                Out of lives — the journey restarts at Level 1.
+              </p>
               <div className="mt-6 flex gap-3">
                 <GameButton onClick={retry} disabled={locked}>
-                  Retry level
+                  Restart from Level 1
                 </GameButton>
                 <GameButton variant="ghost" onClick={quitToMenu}>
                   Menu
@@ -452,9 +461,11 @@ function Hud({ hud, onPause }: { hud: HudState; onPause: () => void }) {
 function TouchControls({
   move,
   jump,
+  dash,
 }: {
   move: (dir: "left" | "right", on: boolean) => void;
   jump: (down: boolean) => void;
+  dash: () => void;
 }) {
   const pad =
     "pointer-events-auto flex h-16 w-16 select-none items-center justify-center rounded-full bg-white/30 text-2xl font-black text-white backdrop-blur active:bg-white/50";
@@ -488,18 +499,30 @@ function TouchControls({
           ▶
         </button>
       </div>
-      <button
-        className={pad}
-        aria-label="Jump"
-        onPointerDown={(e) => {
-          e.preventDefault();
-          jump(true);
-        }}
-        onPointerUp={() => jump(false)}
-        onPointerCancel={() => jump(false)}
-      >
-        ⤒
-      </button>
+      <div className="flex items-end gap-3">
+        <button
+          className={pad}
+          aria-label="Dash"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            dash();
+          }}
+        >
+          »
+        </button>
+        <button
+          className={pad}
+          aria-label="Jump"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            jump(true);
+          }}
+          onPointerUp={() => jump(false)}
+          onPointerCancel={() => jump(false)}
+        >
+          ⤒
+        </button>
+      </div>
     </div>
   );
 }

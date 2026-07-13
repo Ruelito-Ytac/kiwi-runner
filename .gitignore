@@ -6,3 +6,6 @@
 next-env.d.ts
 .DS_Store
 .env*.local
+
+# Raw art packs (extracted into public/moss-*.png, plant-*.png)
+/art-source

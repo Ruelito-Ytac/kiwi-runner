@@ -1,13 +1,22 @@
-import { aabb, moveAndCollide, type Rect } from "./physics";
+import { aabb, crusherOffset, moveAndCollide, type Rect } from "./physics";
 import type {
+  Barrier,
+  Belt,
+  Crumbler,
+  Crusher,
   DifficultyConfig,
+  Dropper,
   Enemy,
   Flyer,
   Gate,
+  Ice,
   Level,
   MovingPlatform,
+  PushBox,
   Spike,
   Spring,
+  Switch,
+  Wind,
 } from "./types";
 
 /* ------------------------------------------------------------------ tuning */
@@ -45,8 +54,24 @@ const FRAME_W = (SHEET.w - 2 * SHEET.inset) / SHEET.frames;
 const JUMP_FRAME = 3; // a leg-tucked pose from the run cycle, held while airborne
 const DRAW_H = 66; // on-screen kiwi height (bigger than the hitbox, feet-aligned)
 const SPRING_V = -1180; // bounce-pad launch (~350px, far higher than a normal jump)
-const GROUND_DIRT = "#84563a"; // sampled from Platform_Grass dirt, fills below the grass cap
+const AIR_JUMPS = 1; // extra mid-air jumps beyond the ground jump (double jump)
+const DASH_SPEED = 720; // px/s horizontal dash burst
+const DASH_TIME = 0.18; // dash duration → ~130px of travel
+const DASH_CD = 0.45; // dash cooldown so it can't be spammed
+const FLOOR_DIRT = "#845639"; // sampled from the floor tiles' dirt — solid fill behind the tiles
+const FLOOR_GRASS_TOP = 45 / 1040; // opaque grass-tip offset in the floor tiles (align tips to the walk line)
+const FLOOR_OVERLAP = 2; // px each floor tile extends over its right neighbour so seams never show
 const PLATFORM_GRASS_TOP = 23 / 427; // opaque grass surface offset in Platform_Grass.png
+
+// Environment-mechanic tuning.
+const CRUMBLE_SHAKE = 0.4; // seconds a crumbler shakes underfoot before it drops
+const CRUMBLE_RESPAWN = 1.9; // seconds a fallen crumbler stays gone before reforming
+const ICE_ACCEL = 620; // px/s^2 grip on ice — low, so you accelerate and skid
+const CRUSH_LETHAL_FROM = 0.55; // cycle fraction where the slam starts (see crusherOffset)
+const CRUSH_LETHAL_TO = 0.8; // …and where the retract begins (safe again after this)
+const DROP_TELEGRAPH = 0.32; // seconds a rock shakes in place before it lets go
+const DROP_RESET = 2.4; // seconds a shattered rock waits before re-arming
+const SURF_EPS = 8; // px tolerance for "feet resting on this surface"
 
 /* ---------------------------------------------------------- theme palettes */
 
@@ -244,7 +269,10 @@ export type GameAssets = {
   cloudBig: HTMLImageElement | null;
   cloudSmall: HTMLImageElement | null;
   thorns: HTMLImageElement | null;
-  platform: HTMLImageElement | null;
+  floorStart: HTMLImageElement | null; // Floor_01_start — left cap (grass drapes left)
+  floorMid: HTMLImageElement | null; // Floor_02_middle_reusable — seamless tile
+  floorEnd: HTMLImageElement | null; // Floor_03_end — right cap (grass drapes right)
+  platform: HTMLImageElement | null; // Platform_Grass — rounded floating platforms/ledges
 };
 
 function loadImage(src: string): Promise<HTMLImageElement | null> {
@@ -296,14 +324,35 @@ async function loadIdleSprite(): Promise<IdleSprite | null> {
 
 /** Preload the new scenery/character assets in parallel. */
 export async function loadAssets(): Promise<GameAssets> {
-  const [idle, cloudBig, cloudSmall, thorns, platform] = await Promise.all([
+  const [
+    idle,
+    cloudBig,
+    cloudSmall,
+    thorns,
+    floorStart,
+    floorMid,
+    floorEnd,
+    platform,
+  ] = await Promise.all([
     loadIdleSprite(),
     loadImage("/Cloud_Big.png"),
     loadImage("/Cloud_Small.png"),
     loadImage("/Thorns.png"),
+    loadImage("/Floor_01_start.png"),
+    loadImage("/Floor_02_middle_reusable.png"),
+    loadImage("/Floor_03_end.png"),
     loadImage("/Platform_Grass.png"),
   ]);
-  return { idle, cloudBig, cloudSmall, thorns, platform };
+  return {
+    idle,
+    cloudBig,
+    cloudSmall,
+    thorns,
+    floorStart,
+    floorMid,
+    floorEnd,
+    platform,
+  };
 }
 
 /* ---------------------------------------------------------- internal state */
@@ -318,6 +367,11 @@ type PlayerState = {
   coyote: number; // seconds of ledge-grace remaining
   jumpBuffer: number; // seconds of buffered jump-press remaining
   jumpHeld: boolean;
+  airJumpsLeft: number; // mid-air jumps remaining (refilled on landing)
+  dashTime: number; // remaining dash duration (0 = not dashing)
+  dashCd: number; // dash cooldown remaining
+  dashDir: 1 | -1; // locked direction of the current dash
+  dashAir: boolean; // an air-dash was already spent this airtime
   invuln: number;
   animTime: number;
   squash: number; // landing squash timer
@@ -332,6 +386,25 @@ type MoverState = MovingPlatform & {
   phase: number;
 };
 type KeyItem = { x: number; y: number; taken: boolean };
+type BoxState = PushBox & { vy: number };
+type SwitchState = Switch & { latchedOn: boolean; active: boolean };
+type BarrierState = Barrier & { open: boolean };
+type CrumblerState = Crumbler & {
+  stage: "solid" | "shaking" | "gone";
+  timer: number;
+};
+type CrusherState = Crusher & {
+  baseY: number; // raised top (immutable); `y` is mutated to the current top
+  cyclePos: number; // 0..1 position in the slam cycle (for the lethal window)
+};
+type DropperState = Dropper & {
+  baseY: number;
+  curY: number; // current top while falling
+  vy: number;
+  restY: number; // top position where the rock shatters on the ground below
+  stage: "armed" | "shaking" | "falling" | "gone";
+  timer: number;
+};
 
 export class KiwiGame {
   private ctx: CanvasRenderingContext2D;
@@ -361,6 +434,15 @@ export class KiwiGame {
   private keyItems: KeyItem[] = [];
   private gate: Gate | null = null;
   private gateOpen = false;
+  private boxes: BoxState[] = [];
+  private switches: SwitchState[] = [];
+  private barriers: BarrierState[] = [];
+  private crumblers: CrumblerState[] = [];
+  private belts: Belt[] = [];
+  private crushers: CrusherState[] = [];
+  private droppers: DropperState[] = [];
+  private iceList: Ice[] = [];
+  private windZones: Wind[] = [];
   private finish = { x: 0, y: 0 };
   private levelCoins = 0;
   private timeLeft: number | null = null;
@@ -437,15 +519,6 @@ export class KiwiGame {
     this.begin();
   }
 
-  /** Retry the current level after a Game Over (fresh lives, coins from earlier
-   *  levels retained). */
-  retry() {
-    this.lives = this.diff.lives;
-    this.dropLevelCoins();
-    this.buildLevel(this.index);
-    this.begin();
-  }
-
   pause() {
     if (!this.running) return;
     this.running = false;
@@ -485,6 +558,18 @@ export class KiwiGame {
     if (this.player.vy < 0) this.player.vy *= JUMP_CUT; // variable jump height
   }
 
+  /** Trigger a horizontal dash in the facing direction. One air-dash per
+   *  airtime; on the ground it's limited only by the cooldown. */
+  dashDown() {
+    const p = this.player;
+    if (p.dashCd > 0 || p.dashTime > 0) return;
+    if (!p.onGround && p.dashAir) return;
+    p.dashTime = DASH_TIME;
+    p.dashDir = p.facing;
+    p.dashCd = DASH_CD;
+    if (!p.onGround) p.dashAir = true;
+  }
+
   private onKeyDown(e: KeyboardEvent) {
     if (this.status !== "playing" || !this.running) return;
     switch (e.code) {
@@ -501,6 +586,11 @@ export class KiwiGame {
       case "Space":
         if (!e.repeat) this.jumpDown();
         e.preventDefault();
+        break;
+      case "ShiftLeft":
+      case "ShiftRight":
+      case "KeyK":
+        if (!e.repeat) this.dashDown();
         break;
       case "Escape":
         this.cb.onPauseRequest();
@@ -550,7 +640,22 @@ export class KiwiGame {
     this.flyers = lv.hazards
       .filter((h): h is Flyer => h.type === "flyer")
       .map((f) => ({ ...f, originX: f.x, y0: f.y, dir: 1 }));
-    this.spikes = lv.hazards.filter((h): h is Spike => h.type === "spike");
+    // Copy spikes (so clamping never mutates the shared level data) and pull
+    // any thorn off the start/end floor caps into the flat middle of its slab,
+    // so it never renders hanging over a ledge.
+    this.spikes = lv.hazards
+      .filter((h): h is Spike => h.type === "spike")
+      .map((sp) => ({ ...sp }));
+    const CAP = 150; // world px reserved at each end of a ground slab
+    for (const sp of this.spikes) {
+      const g = this.platforms.find(
+        (p) => p.h > 60 && sp.x + sp.w > p.x && sp.x < p.x + p.w,
+      );
+      if (!g) continue;
+      const lo = g.x + CAP;
+      const hi = g.x + g.w - CAP - sp.w;
+      sp.x = hi >= lo ? clamp(sp.x, lo, hi) : g.x + (g.w - sp.w) / 2;
+    }
     this.movers = (lv.movers ?? []).map((m, idx) => ({
       ...m,
       baseX: m.x,
@@ -561,6 +666,35 @@ export class KiwiGame {
     this.keyItems = (lv.keys ?? []).map((k) => ({ ...k, taken: false }));
     this.gate = lv.gate ? { ...lv.gate } : null;
     this.gateOpen = this.keyItems.length === 0; // no keys → nothing to unlock
+    this.boxes = (lv.boxes ?? []).map((b) => ({ ...b, vy: 0 }));
+    this.switches = (lv.switches ?? []).map((s) => ({
+      ...s,
+      latchedOn: false,
+      active: false,
+    }));
+    this.barriers = (lv.barriers ?? []).map((b) => ({ ...b, open: false }));
+    this.crumblers = (lv.crumblers ?? []).map((c) => ({
+      ...c,
+      stage: "solid" as const,
+      timer: 0,
+    }));
+    this.belts = (lv.belts ?? []).map((b) => ({ ...b }));
+    this.crushers = (lv.crushers ?? []).map((c) => ({
+      ...c,
+      baseY: c.y,
+      cyclePos: 0,
+    }));
+    this.droppers = (lv.droppers ?? []).map((d) => ({
+      ...d,
+      baseY: d.y,
+      curY: d.y,
+      vy: 0,
+      restY: this.surfaceUnder(d.x, d.w, d.y + d.h) - d.h,
+      stage: "armed" as const,
+      timer: 0,
+    }));
+    this.iceList = (lv.ice ?? []).map((i) => ({ ...i }));
+    this.windZones = (lv.wind ?? []).map((w) => ({ ...w }));
     this.finish = { ...lv.finish };
     this.levelCoins = 0;
     this.timeLeft = this.diff.timeLimitSec;
@@ -621,27 +755,55 @@ export class KiwiGame {
     if (p.invuln > 0) p.invuln -= dt;
     if (p.squash > 0) p.squash -= dt;
     if (p.jumpBuffer > 0) p.jumpBuffer -= dt;
+    if (p.dashCd > 0) p.dashCd -= dt;
 
-    // horizontal intent
-    const speed = MOVE_SPEED * this.diff.playerSpeedMul;
-    p.vx = (Number(this.input.right) - Number(this.input.left)) * speed;
-    if (p.vx > 0) p.facing = 1;
-    else if (p.vx < 0) p.facing = -1;
+    if (p.dashTime > 0) {
+      // Dash: a fixed horizontal burst with vertical motion frozen, so it
+      // reliably crosses gaps. Overrides normal movement + gravity while active.
+      p.dashTime -= dt;
+      p.vx = p.dashDir * DASH_SPEED;
+      p.vy = 0;
+    } else {
+      // horizontal intent — snappy by default, momentum while on ice
+      const speed = MOVE_SPEED * this.diff.playerSpeedMul;
+      const target = (Number(this.input.right) - Number(this.input.left)) * speed;
+      if (this.onIce()) {
+        // icy grip: ease toward the target so the kiwi accelerates and skids
+        p.vx += clamp(target - p.vx, -ICE_ACCEL * dt, ICE_ACCEL * dt);
+      } else {
+        p.vx = target;
+      }
+      // environmental drag: conveyor belts (while riding) + wind gusts (airborne too)
+      p.vx += this.beltPush() + this.windPush();
+      // face where you steer, not where the wind/belt shoves you
+      if (target > 0) p.facing = 1;
+      else if (target < 0) p.facing = -1;
 
-    // jump: buffered press + within coyote window
-    if (p.jumpBuffer > 0 && p.coyote > 0) {
-      p.vy = JUMP_VELOCITY;
-      p.onGround = false;
-      p.coyote = 0;
-      p.jumpBuffer = 0;
+      // jump: a ground/coyote jump if available, otherwise a mid-air jump
+      if (p.jumpBuffer > 0 && p.coyote > 0) {
+        p.vy = JUMP_VELOCITY;
+        p.onGround = false;
+        p.coyote = 0;
+        p.jumpBuffer = 0;
+      } else if (p.jumpBuffer > 0 && !p.onGround && p.airJumpsLeft > 0) {
+        p.vy = JUMP_VELOCITY; // double jump — crisp reset of vertical velocity
+        p.airJumpsLeft--;
+        p.jumpBuffer = 0;
+        p.squash = 0.1;
+      }
+
+      // gravity
+      p.vy = Math.min(p.vy + GRAVITY * dt, MAX_FALL);
     }
-
-    // gravity
-    p.vy = Math.min(p.vy + GRAVITY * dt, MAX_FALL);
 
     // moving platforms advance first and carry a rider along with them
     const wasOnGround = p.onGround;
+    this.updateSwitches(); // set barriers open/closed before this frame's collisions
     this.updateMovers();
+    this.updateCrumblers(dt); // collapse timers → may remove a solid before we collide
+    this.updateCrushers(); // advance slam cycles (position + lethal window)
+    this.updateDroppers(dt); // arm/drop/reset falling rocks
+    this.updateBoxes(p.vx * dt, dt); // push crates the player walks into, + box gravity
 
     // integrate + resolve against all solids (per-axis, no clip-through)
     const res = moveAndCollide(
@@ -656,9 +818,11 @@ export class KiwiGame {
     if (res.hitHead) p.vy = 0;
     p.onGround = res.onGround;
 
-    // coyote refresh + landing squash
+    // coyote refresh + landing squash; landing refills the air jumps + air-dash
     if (p.onGround) {
       p.coyote = this.diff.coyoteMs / 1000;
+      p.airJumpsLeft = AIR_JUMPS;
+      p.dashAir = false;
       if (!wasOnGround) p.squash = 0.12;
     } else {
       p.coyote = Math.max(0, p.coyote - dt);
@@ -738,14 +902,88 @@ export class KiwiGame {
   }
 
   /** Everything the player collides with: static platforms, moving platforms,
-   *  and the gate while it's still locked. */
+   *  conveyor belts, intact crumblers, the gate while it's still locked,
+   *  pushable boxes, and closed barriers. Crushers are NOT here — they are pure
+   *  timed hazards you pass under, not surfaces you ride. */
   private solids(): Rect[] {
     const s: Rect[] = this.platforms.slice();
     for (const m of this.movers) s.push({ x: m.x, y: m.y, w: m.w, h: m.h });
-    if (this.gate && !this.gateOpen) {
-      s.push({ ...this.gate });
-    }
+    for (const b of this.belts) s.push({ x: b.x, y: b.y, w: b.w, h: b.h });
+    for (const c of this.crumblers)
+      if (c.stage !== "gone") s.push({ x: c.x, y: c.y, w: c.w, h: c.h });
+    if (this.gate && !this.gateOpen) s.push({ ...this.gate });
+    for (const b of this.boxes) s.push({ x: b.x, y: b.y, w: b.w, h: b.h });
+    for (const bar of this.barriers)
+      if (!bar.open) s.push({ x: bar.x, y: bar.y, w: bar.w, h: bar.h });
     return s;
+  }
+
+  /** Solids a box collides with: the world, closed barriers, and OTHER boxes —
+   *  but not itself or the player (the player push is resolved separately). */
+  private solidsForBox(self: BoxState): Rect[] {
+    const s: Rect[] = this.platforms.slice();
+    for (const m of this.movers) s.push({ x: m.x, y: m.y, w: m.w, h: m.h });
+    if (this.gate && !this.gateOpen) s.push({ ...this.gate });
+    for (const bar of this.barriers)
+      if (!bar.open) s.push({ x: bar.x, y: bar.y, w: bar.w, h: bar.h });
+    for (const b of this.boxes)
+      if (b !== self) s.push({ x: b.x, y: b.y, w: b.w, h: b.h });
+    return s;
+  }
+
+  /** Push any box the grounded player is walking into (before the player's own
+   *  collision resolves against it), and advance box gravity. */
+  private updateBoxes(dx: number, dt: number) {
+    const p = this.player;
+    if (p.onGround && dx !== 0) {
+      const dir = dx > 0 ? 1 : -1;
+      const pr = this.playerRect();
+      for (const b of this.boxes) {
+        const vOverlap = pr.y + pr.h > b.y + 6 && pr.y < b.y + b.h - 6;
+        if (!vOverlap) continue;
+        // only push from the correct side, and only when about to make contact
+        const gap = dir > 0 ? b.x - (pr.x + pr.w) : pr.x - (b.x + b.w);
+        if (gap > Math.abs(dx) + 2 || gap < -6) continue;
+        const res = moveAndCollide(
+          { x: b.x, y: b.y, w: b.w, h: b.h },
+          dx,
+          0,
+          this.solidsForBox(b),
+        );
+        b.x = res.x;
+      }
+    }
+    for (const b of this.boxes) {
+      b.vy = Math.min(b.vy + GRAVITY * dt, MAX_FALL);
+      const res = moveAndCollide(
+        { x: b.x, y: b.y, w: b.w, h: b.h },
+        0,
+        b.vy * dt,
+        this.solidsForBox(b),
+      );
+      b.y = res.y;
+      if (res.onGround) b.vy = 0;
+    }
+    this.boxes = this.boxes.filter((b) => b.y <= DEATH_Y); // lost down a pit
+  }
+
+  /** A plate is pressed while the player's feet or a box's base rest on it;
+   *  a `latch` plate stays on once first pressed. Barriers open while any of
+   *  their switches is active. */
+  private updateSwitches() {
+    const pr = this.playerRect();
+    for (const bar of this.barriers) bar.open = false;
+    const on = (bx: number, bw: number, by: number, bh: number, s: Switch) =>
+      bx + bw > s.x && bx < s.x + s.w && by + bh >= s.y - 8 && by + bh <= s.y + 12;
+    for (const s of this.switches) {
+      const pressed =
+        on(pr.x, pr.w, pr.y, pr.h, s) ||
+        this.boxes.some((b) => on(b.x, b.w, b.y, b.h, s));
+      if (pressed) s.latchedOn = true;
+      s.active = s.latch ? s.latchedOn : pressed;
+      const bar = this.barriers[s.barrier];
+      if (s.active && bar) bar.open = true;
+    }
   }
 
   /** Advance each moving platform along its sine path and, if the player is
@@ -792,6 +1030,170 @@ export class KiwiGame {
     }
   }
 
+  /** True while the kiwi's feet rest on an ice patch (grounded only — ice never
+   *  touches your airborne control, which keeps it forgiving near pits). */
+  private onIce(): boolean {
+    const p = this.player;
+    if (!p.onGround) return false;
+    const foot = p.y + PLAYER.h;
+    for (const ice of this.iceList) {
+      if (
+        p.x + PLAYER.w > ice.x &&
+        p.x < ice.x + ice.w &&
+        Math.abs(foot - ice.y) <= SURF_EPS
+      )
+        return true;
+    }
+    return false;
+  }
+
+  /** Horizontal drag from any conveyor belt the grounded kiwi is standing on. */
+  private beltPush(): number {
+    const p = this.player;
+    if (!p.onGround) return 0;
+    const foot = p.y + PLAYER.h;
+    let push = 0;
+    for (const b of this.belts) {
+      if (
+        p.x + PLAYER.w > b.x &&
+        p.x < b.x + b.w &&
+        Math.abs(foot - b.y) <= SURF_EPS
+      )
+        push += b.dir * b.speed;
+    }
+    return push;
+  }
+
+  /** Horizontal push from any wind zone the kiwi's centre is inside (airborne
+   *  too — being blown mid-jump is the whole point). */
+  private windPush(): number {
+    const p = this.player;
+    const cx = p.x + PLAYER.w / 2;
+    const cy = p.y + PLAYER.h / 2;
+    let push = 0;
+    for (const z of this.windZones) {
+      if (cx > z.x && cx < z.x + z.w && cy > z.y && cy < z.y + z.h)
+        push += z.push;
+    }
+    return push;
+  }
+
+  /** Topmost solid surface strictly below `fromY` in the column [x, x+w] — where
+   *  a dropped rock shatters. DEATH_Y if nothing is below (it falls into a pit). */
+  private surfaceUnder(x: number, w: number, fromY: number): number {
+    let best = DEATH_Y;
+    for (const p of this.platforms) {
+      if (p.x < x + w && p.x + p.w > x && p.y >= fromY && p.y < best) best = p.y;
+    }
+    return best;
+  }
+
+  /** Restore per-attempt mechanic state on an Easy/Medium respawn. Coins/keys are
+   *  intentionally kept; everything positional resets for a fair retry. */
+  private resetMechanicsForRespawn() {
+    for (const c of this.crumblers) {
+      c.stage = "solid";
+      c.timer = 0;
+    }
+    for (const d of this.droppers) {
+      d.stage = "armed";
+      d.curY = d.baseY;
+      d.vy = 0;
+      d.timer = 0;
+    }
+    this.boxes = (this.level.boxes ?? []).map((b) => ({ ...b, vy: 0 }));
+    for (const s of this.switches) {
+      s.latchedOn = false;
+      s.active = false;
+    }
+    for (const bar of this.barriers) bar.open = false;
+  }
+
+  /** Crumbling blocks: once the kiwi lands on one it shakes, then drops away and
+   *  reforms after a pause (but never back inside the player). */
+  private updateCrumblers(dt: number) {
+    const p = this.player;
+    const foot = p.y + PLAYER.h;
+    for (const c of this.crumblers) {
+      if (c.stage === "solid") {
+        const standing =
+          p.onGround &&
+          p.x + PLAYER.w > c.x &&
+          p.x < c.x + c.w &&
+          Math.abs(foot - c.y) <= SURF_EPS;
+        if (standing) {
+          c.stage = "shaking";
+          c.timer = CRUMBLE_SHAKE;
+        }
+      } else if (c.stage === "shaking") {
+        c.timer -= dt;
+        if (c.timer <= 0) {
+          c.stage = "gone";
+          c.timer = CRUMBLE_RESPAWN;
+        }
+      } else {
+        c.timer -= dt;
+        const clear = !aabb(this.playerRect(), {
+          x: c.x,
+          y: c.y,
+          w: c.w,
+          h: c.h,
+        });
+        if (c.timer <= 0 && clear) c.stage = "solid";
+      }
+    }
+  }
+
+  /** Advance each crusher's slam cycle: set its current top (`y`) and cycle
+   *  position (which `checkHazards` reads for the lethal window). */
+  private updateCrushers() {
+    for (const c of this.crushers) {
+      c.cyclePos = mod(this.time / c.period + (c.phase ?? 0), 1);
+      c.y = c.baseY + crusherOffset(c.cyclePos) * c.range;
+    }
+  }
+
+  /** Falling rocks: arm → shake (telegraph) → fall (lethal) → shatter → re-arm. */
+  private updateDroppers(dt: number) {
+    const p = this.player;
+    const pr = this.playerRect();
+    for (const d of this.droppers) {
+      switch (d.stage) {
+        case "armed": {
+          const under = pr.x + pr.w > d.x && pr.x < d.x + d.w && p.y > d.baseY;
+          if (under) {
+            d.stage = "shaking";
+            d.timer = DROP_TELEGRAPH;
+          }
+          break;
+        }
+        case "shaking":
+          d.timer -= dt;
+          if (d.timer <= 0) {
+            d.stage = "falling";
+            d.vy = 0;
+          }
+          break;
+        case "falling":
+          d.vy = Math.min(d.vy + GRAVITY * dt, MAX_FALL);
+          d.curY += d.vy * dt;
+          if (d.curY >= d.restY) {
+            d.curY = d.restY;
+            d.stage = "gone";
+            d.timer = DROP_RESET;
+          }
+          break;
+        case "gone":
+          d.timer -= dt;
+          if (d.timer <= 0) {
+            d.curY = d.baseY;
+            d.stage = "armed";
+          }
+          break;
+      }
+    }
+  }
+
   private collectKeys() {
     if (this.keyItems.length === 0) return;
     const pr = this.playerRect();
@@ -828,6 +1230,17 @@ export class KiwiGame {
       if (aabb(pr, { x: f.x + 4, y: f.y + 4, w: f.w - 8, h: f.h - 8 }))
         return this.takeHit();
     }
+    for (const c of this.crushers) {
+      // lethal only during the slam + bottom hold (safe while raised/retracting)
+      if (c.cyclePos < CRUSH_LETHAL_FROM || c.cyclePos > CRUSH_LETHAL_TO) continue;
+      if (aabb(pr, { x: c.x + 3, y: c.y + 3, w: c.w - 6, h: c.h - 3 }))
+        return this.takeHit();
+    }
+    for (const d of this.droppers) {
+      if (d.stage !== "falling") continue;
+      if (aabb(pr, { x: d.x + 4, y: d.curY + 4, w: d.w - 8, h: d.h - 6 }))
+        return this.takeHit();
+    }
     return false;
   }
 
@@ -852,6 +1265,7 @@ export class KiwiGame {
         f.x = f.originX;
         f.dir = 1;
       }
+      this.resetMechanicsForRespawn();
       this.player.x = this.level.spawn.x;
       this.player.y = this.level.spawn.y;
       this.player.vx = 0;
@@ -942,14 +1356,23 @@ export class KiwiGame {
     ctx.save();
     ctx.translate(-this.camX, 0);
     this.drawPlatforms(pal);
+    this.drawIce();
     this.drawMovers();
+    this.drawBelts();
+    this.drawCrumblers();
     this.drawSprings();
     this.drawGate();
+    this.drawSwitches();
+    this.drawBarriers();
     this.drawCoins();
     this.drawKeys();
     this.drawSpikes();
+    this.drawBoxes();
+    this.drawCrushers();
+    this.drawDroppers();
     this.drawEnemies();
     this.drawFlyers();
+    this.drawWind();
     this.drawFinish();
     this.drawPlayer();
     ctx.restore();
@@ -1039,36 +1462,48 @@ export class KiwiGame {
 
   private drawPlatforms(pal: Palette) {
     const ctx = this.ctx;
-    const img = this.assets.platform;
+    const { floorStart: s, floorMid: m, floorEnd: e } = this.assets;
     for (const p of this.platforms) {
       // cull off-screen
       if (p.x + p.w < this.camX || p.x > this.camX + LOGICAL_W) continue;
-      if (!img) {
+      if (!m) {
         ctx.fillStyle = pal.ground;
         ctx.fillRect(p.x, p.y, p.w, p.h);
         ctx.fillStyle = pal.grass;
-        ctx.fillRect(p.x, p.y, p.w, 10); // grassy top band
+        ctx.fillRect(p.x, p.y, p.w, 10);
       } else if (p.h > 60) {
-        // Ground slab: fill solid dirt from the surface down so the top is
-        // opaque exactly at p.y (nothing floats over the art's transparent top
-        // padding), then tile the grass cap along the top at its natural aspect
-        // for a continuous grassy surface with dirt clearly below it.
-        ctx.fillStyle = GROUND_DIRT;
-        ctx.fillRect(p.x, p.y, p.w, p.h);
-        const capH = 58;
-        const tileW = capH * (img.width / img.height);
-        for (let x = p.x; x < p.x + p.w; x += tileW) {
-          const w = Math.min(tileW, p.x + p.w - x);
-          const sw = (img.width * w) / tileW; // crop the last partial tile clean
-          ctx.drawImage(img, 0, 0, sw, img.height, x, p.y - 5, w, capH);
+        // Ground: solid dirt fill (never shows background through seams/overhang)
+        // with the floor tileset laid start | middle… | end. Tiles are scaled to
+        // the rect height and shifted up so the grass tips sit on the walk line.
+        // Each tile is drawn a hair wider than its slot (FLOOR_OVERLAP) so the
+        // next tile paints over it — no sub-pixel seam ever shows through.
+        const scale = p.h / m.height;
+        const top = p.y - m.height * FLOOR_GRASS_TOP * scale;
+        const sW = (s?.width ?? 0) * scale;
+        const eW = (e?.width ?? 0) * scale;
+        const mW = m.width * scale;
+        const ov = FLOOR_OVERLAP;
+        ctx.fillStyle = FLOOR_DIRT;
+        // Back only the region behind the OPAQUE middle tiles, NOT the caps. The start/end cap
+        // tiles have rounded grass edges with transparent corners; a full-width square fill pokes
+        // brown out past that rounded overhang. Insetting the backing to [sW, w-eW] lets the caps'
+        // rounded ends show the sky behind them (the intended platform-end look), not a brown block.
+        ctx.fillRect(p.x + sW, p.y, Math.max(0, p.w - sW - eW), p.h);
+        if (s) ctx.drawImage(s, p.x, top, sW + ov, p.h);
+        const midEnd = p.x + p.w - eW;
+        for (let x = p.x + sW; x < midEnd; x += mW) {
+          const w = Math.min(mW, midEnd - x);
+          const sw = (m.width * w) / mW; // crop the last middle tile clean
+          ctx.drawImage(m, 0, 0, sw, m.height, x, top, w + ov, p.h);
         }
-      } else {
-        // Floating block / ledge: draw the whole slab at its NATURAL aspect
-        // (width = the platform width) so it isn't squashed flat. Anchor the
-        // grass surface to p.y; the slab's dirt hangs a little below the thin
-        // collision rect, which reads as a chunky floating platform.
-        const dh = p.w * (img.height / img.width);
-        ctx.drawImage(img, p.x, p.y - dh * PLATFORM_GRASS_TOP, p.w, dh);
+        if (e) ctx.drawImage(e, p.x + p.w - eW, top, eW, p.h);
+      } else if (this.assets.platform) {
+        // Floating block/ledge: the rounded Platform_Grass piece at natural
+        // aspect (a proper floating platform, not a cut-out floor chunk). Grass
+        // surface anchored to the walk line; dirt hangs below the thin rect.
+        const plat = this.assets.platform;
+        const dh = p.w * (plat.height / plat.width);
+        ctx.drawImage(plat, p.x, p.y - dh * PLATFORM_GRASS_TOP, p.w, dh);
       }
     }
   }
@@ -1243,6 +1678,186 @@ export class KiwiGame {
     }
   }
 
+  /** A frosty crust on the surface line so ice patches read as slippery. */
+  private drawIce() {
+    const ctx = this.ctx;
+    for (const ice of this.iceList) {
+      if (ice.x + ice.w < this.camX || ice.x > this.camX + LOGICAL_W) continue;
+      ctx.fillStyle = "rgba(205,238,255,0.9)";
+      ctx.fillRect(ice.x, ice.y, ice.w, 7);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.fillRect(ice.x, ice.y, ice.w, 2); // bright sheen on the walk line
+      ctx.fillStyle = "rgba(120,180,220,0.5)";
+      ctx.fillRect(ice.x, ice.y + 6, ice.w, 2);
+    }
+  }
+
+  /** Conveyor belts: a rubber slab with tread arrows scrolling toward `dir`. */
+  private drawBelts() {
+    const ctx = this.ctx;
+    for (const b of this.belts) {
+      if (b.x + b.w < this.camX || b.x > this.camX + LOGICAL_W) continue;
+      ctx.fillStyle = "#3a3f4b";
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.fillRect(b.x, b.y, b.w, 3);
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.fillRect(b.x, b.y + b.h - 3, b.w, 3);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(b.x, b.y, b.w, b.h);
+      ctx.clip();
+      ctx.fillStyle = "rgba(255,210,90,0.9)";
+      const spacing = 26;
+      const my = b.y + b.h / 2;
+      const scroll = mod(this.time * b.speed * b.dir * 0.25, spacing);
+      for (let x = b.x - spacing + scroll; x < b.x + b.w + spacing; x += spacing) {
+        ctx.beginPath();
+        if (b.dir > 0) {
+          ctx.moveTo(x, my - 5);
+          ctx.lineTo(x + 7, my);
+          ctx.lineTo(x, my + 5);
+        } else {
+          ctx.moveTo(x + 7, my - 5);
+          ctx.lineTo(x, my);
+          ctx.lineTo(x + 7, my + 5);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  /** Crumbling blocks: earthy and cracked, jittering while shaking, gone once
+   *  they drop. */
+  private drawCrumblers() {
+    const ctx = this.ctx;
+    for (const c of this.crumblers) {
+      if (c.stage === "gone") continue;
+      if (c.x + c.w < this.camX || c.x > this.camX + LOGICAL_W) continue;
+      const shake = c.stage === "shaking" ? Math.sin(this.time * 60) * 2 : 0;
+      ctx.save();
+      ctx.translate(shake, 0);
+      ctx.fillStyle = "#8a6a4a";
+      ctx.fillRect(c.x, c.y, c.w, c.h);
+      ctx.fillStyle = "#6f5238";
+      ctx.fillRect(c.x, c.y, c.w, 5);
+      ctx.strokeStyle = "rgba(30,20,10,0.6)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(c.x + c.w * 0.3, c.y);
+      ctx.lineTo(c.x + c.w * 0.42, c.y + c.h);
+      ctx.moveTo(c.x + c.w * 0.72, c.y);
+      ctx.lineTo(c.x + c.w * 0.6, c.y + c.h);
+      ctx.moveTo(c.x + c.w * 0.5, c.y + c.h * 0.45);
+      ctx.lineTo(c.x + c.w * 0.5, c.y + c.h);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  /** Slamming crushers: a studded block on a guide rail with a spiked underside,
+   *  tinted red while its strike is lethal. */
+  private drawCrushers() {
+    const ctx = this.ctx;
+    for (const c of this.crushers) {
+      if (c.x + c.w < this.camX || c.x > this.camX + LOGICAL_W) continue;
+      const lethal =
+        c.cyclePos >= CRUSH_LETHAL_FROM && c.cyclePos <= CRUSH_LETHAL_TO;
+      // guide rail from the top of the view down to the block
+      ctx.fillStyle = "rgba(40,44,52,0.45)";
+      ctx.fillRect(c.x + c.w / 2 - 3, 0, 6, Math.max(0, c.y));
+      ctx.fillStyle = lethal ? "#7a3b3b" : "#555b66";
+      ctx.fillRect(c.x, c.y, c.w, c.h);
+      ctx.fillStyle = "rgba(255,255,255,0.12)";
+      ctx.fillRect(c.x, c.y, c.w, 5);
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      for (let sx = c.x + 9; sx < c.x + c.w - 6; sx += 18) {
+        ctx.beginPath();
+        ctx.arc(sx, c.y + 11, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // spiked bottom face — the business end
+      ctx.fillStyle = "#c9ccd4";
+      const teeth = Math.max(2, Math.round(c.w / 16));
+      const tw = c.w / teeth;
+      for (let i = 0; i < teeth; i++) {
+        const x = c.x + i * tw;
+        ctx.beginPath();
+        ctx.moveTo(x, c.y + c.h);
+        ctx.lineTo(x + tw / 2, c.y + c.h + 10);
+        ctx.lineTo(x + tw, c.y + c.h);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+
+  /** Falling rocks: a chunky boulder that jitters as it lets go, then plummets. */
+  private drawDroppers() {
+    const ctx = this.ctx;
+    for (const d of this.droppers) {
+      if (d.stage === "gone") continue;
+      if (d.x + d.w < this.camX || d.x > this.camX + LOGICAL_W) continue;
+      const jit = d.stage === "shaking" ? Math.sin(this.time * 70) * 2 : 0;
+      const x = d.x + jit;
+      const y = d.curY;
+      ctx.fillStyle = "#6b6e73";
+      ctx.beginPath();
+      ctx.moveTo(x + d.w * 0.5, y);
+      ctx.lineTo(x + d.w, y + d.h * 0.4);
+      ctx.lineTo(x + d.w * 0.82, y + d.h);
+      ctx.lineTo(x + d.w * 0.18, y + d.h);
+      ctx.lineTo(x, y + d.h * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      ctx.beginPath();
+      ctx.moveTo(x + d.w * 0.5, y);
+      ctx.lineTo(x + d.w, y + d.h * 0.4);
+      ctx.lineTo(x + d.w * 0.55, y + d.h * 0.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  /** Wind zones: a faint tint plus streaks scrolling toward the push direction,
+   *  so a gust is always visible before it shoves you. */
+  private drawWind() {
+    const ctx = this.ctx;
+    for (const z of this.windZones) {
+      if (z.x + z.w < this.camX || z.x > this.camX + LOGICAL_W) continue;
+      const dir = z.push >= 0 ? 1 : -1;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(z.x, z.y, z.w, z.h);
+      ctx.clip();
+      ctx.fillStyle =
+        dir > 0 ? "rgba(180,220,255,0.08)" : "rgba(255,224,190,0.08)";
+      ctx.fillRect(z.x, z.y, z.w, z.h);
+      ctx.strokeStyle = "rgba(255,255,255,0.32)";
+      ctx.lineWidth = 2;
+      const spacing = 48;
+      const speed = Math.abs(z.push) * 1.4 + 60;
+      const scroll = mod(this.time * speed * dir, spacing);
+      const rows = 6;
+      for (let r = 0; r < rows; r++) {
+        const yy = z.y + 14 + (r * (z.h - 28)) / rows + (r % 2) * 7;
+        for (let x = z.x - spacing + scroll; x < z.x + z.w + spacing; x += spacing) {
+          ctx.beginPath();
+          ctx.moveTo(x, yy);
+          ctx.lineTo(x + dir * 22, yy);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
+
   private drawKeys() {
     const ctx = this.ctx;
     for (const k of this.keyItems) {
@@ -1282,6 +1897,61 @@ export class KiwiGame {
     ctx.beginPath();
     ctx.arc(g.x + g.w / 2, g.y + g.h / 2, 7, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  private drawBoxes() {
+    const ctx = this.ctx;
+    for (const b of this.boxes) {
+      if (b.x + b.w < this.camX || b.x > this.camX + LOGICAL_W) continue;
+      ctx.fillStyle = "#a9743f"; // crate
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = "#c48a52";
+      ctx.fillRect(b.x + 3, b.y + 3, b.w - 6, b.h - 6); // face
+      ctx.strokeStyle = "#5e3c1e";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3);
+      // diagonal planks
+      ctx.beginPath();
+      ctx.moveTo(b.x + 3, b.y + 3);
+      ctx.lineTo(b.x + b.w - 3, b.y + b.h - 3);
+      ctx.moveTo(b.x + b.w - 3, b.y + 3);
+      ctx.lineTo(b.x + 3, b.y + b.h - 3);
+      ctx.stroke();
+    }
+  }
+
+  private drawSwitches() {
+    const ctx = this.ctx;
+    for (const s of this.switches) {
+      if (s.x + s.w < this.camX || s.x > this.camX + LOGICAL_W) continue;
+      const down = s.active ? 4 : 0; // plate presses down when active
+      // base
+      ctx.fillStyle = "#33404a";
+      ctx.fillRect(s.x, s.y - 4, s.w, s.h + 4);
+      // plate
+      ctx.fillStyle = s.active ? "#39d98a" : "#e06a5a";
+      ctx.fillRect(s.x + 3, s.y - 10 + down, s.w - 6, 10 - down);
+      // a lever nub for latch switches, a flat plate otherwise
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fillRect(s.x + 3, s.y - 10 + down, s.w - 6, 2);
+    }
+  }
+
+  private drawBarriers() {
+    const ctx = this.ctx;
+    for (const bar of this.barriers) {
+      if (bar.open) continue; // open = passable = invisible
+      if (bar.x + bar.w < this.camX || bar.x > this.camX + LOGICAL_W) continue;
+      ctx.fillStyle = "#4a5560"; // steel barrier
+      ctx.fillRect(bar.x, bar.y, bar.w, bar.h);
+      ctx.fillStyle = "#6b7784";
+      for (let y = bar.y + 5; y < bar.y + bar.h; y += 16) {
+        ctx.fillRect(bar.x + 2, y, bar.w - 4, 4);
+      }
+      ctx.strokeStyle = "#2b333a";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(bar.x + 1, bar.y + 1, bar.w - 2, bar.h - 2);
+    }
   }
 
   private drawFinish() {
@@ -1330,8 +2000,9 @@ export class KiwiGame {
 
     const drawH = DRAW_H;
     const squashK = p.squash > 0 ? p.squash / 0.12 : 0;
-    const sy = 1 - 0.18 * squashK; // squash on landing
-    const sx = 1 + 0.12 * squashK;
+    const dashK = p.dashTime > 0 ? 1 : 0; // stretch into the dash for motion feel
+    const sy = (1 - 0.18 * squashK) * (1 - 0.12 * dashK);
+    const sx = (1 + 0.12 * squashK) * (1 + 0.22 * dashK);
 
     const cx = p.x + PLAYER.w / 2;
     const footY = p.y + PLAYER.h + bob;
@@ -1391,6 +2062,11 @@ function blankPlayer(): PlayerState {
     coyote: 0,
     jumpBuffer: 0,
     jumpHeld: false,
+    airJumpsLeft: AIR_JUMPS,
+    dashTime: 0,
+    dashCd: 0,
+    dashDir: 1,
+    dashAir: false,
     invuln: 0,
     animTime: 0,
     squash: 0,

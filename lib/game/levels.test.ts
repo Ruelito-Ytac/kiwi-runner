@@ -11,6 +11,8 @@ const GROUND_Y = 480;
 const MAX_BLOCK_UP = 150;
 const MAX_GAP = 170;
 const MAX_COIN_UP = 210;
+const RUN_SPEED = 240; // must match engine MOVE_SPEED — belts/wind stay under it
+const PLAYER_H = 52; // must match engine PLAYER.h
 
 describe("level reachability", () => {
   for (const lv of LEVELS) {
@@ -81,4 +83,71 @@ describe("level reachability", () => {
       }
     });
   }
+});
+
+// Invariants for the environment mechanics — the things that keep new levels
+// beatable and honour "longer the higher the level".
+describe("mechanic safety invariants", () => {
+  it("keeps every belt slower than the run speed (always escapable)", () => {
+    for (const lv of LEVELS)
+      for (const b of lv.belts ?? [])
+        expect(Math.abs(b.speed), `L${lv.id} belt@${b.x}`).toBeLessThan(
+          RUN_SPEED,
+        );
+  });
+
+  it("keeps every wind gust weaker than the run speed (progress always possible)", () => {
+    for (const lv of LEVELS)
+      for (const w of lv.wind ?? [])
+        expect(Math.abs(w.push), `L${lv.id} wind@${w.x}`).toBeLessThan(
+          RUN_SPEED,
+        );
+  });
+
+  it("raises every crusher clear of a kiwi standing on the ground below", () => {
+    // The raised bottom (y + h) must sit above a standing player's head so the
+    // safe window is genuinely safe to run under.
+    for (const lv of LEVELS)
+      for (const c of lv.crushers ?? [])
+        expect(c.y + c.h, `L${lv.id} crusher@${c.x}`).toBeLessThanOrEqual(
+          GROUND_Y - PLAYER_H,
+        );
+  });
+
+  it("points every switch at a real barrier", () => {
+    for (const lv of LEVELS)
+      for (const s of lv.switches ?? [])
+        expect(
+          lv.barriers?.[s.barrier],
+          `L${lv.id} switch→barrier[${s.barrier}]`,
+        ).toBeDefined();
+  });
+
+  it("makes each level at least as long as the one before it", () => {
+    for (let i = 1; i < LEVELS.length; i++)
+      expect(
+        LEVELS[i]!.worldWidth,
+        `L${LEVELS[i]!.id} vs L${LEVELS[i - 1]!.id}`,
+      ).toBeGreaterThanOrEqual(LEVELS[i - 1]!.worldWidth);
+  });
+
+  it("keeps every mechanic inside the world bounds", () => {
+    for (const lv of LEVELS) {
+      const items: { x: number; w: number }[] = [
+        ...(lv.belts ?? []),
+        ...(lv.crumblers ?? []),
+        ...(lv.crushers ?? []),
+        ...(lv.droppers ?? []),
+        ...(lv.ice ?? []),
+        ...(lv.wind ?? []),
+        ...(lv.boxes ?? []),
+        ...(lv.switches ?? []),
+        ...(lv.barriers ?? []),
+      ];
+      for (const m of items) {
+        expect(m.x, `L${lv.id}`).toBeGreaterThanOrEqual(0);
+        expect(m.x + m.w, `L${lv.id}`).toBeLessThanOrEqual(lv.worldWidth);
+      }
+    }
+  });
 });
