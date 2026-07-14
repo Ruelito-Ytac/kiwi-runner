@@ -47,6 +47,12 @@ const EMPTY_ASSETS: GameAssets = {
   jumpTakeoff: [],
   jumpLand: [],
   doubleJump: [],
+  drySoil: null,
+  bgTrees: [],
+  midTrees: [],
+  batSprite: null,
+  ratWalk: null,
+  deadKiwi: null,
 };
 
 export function KiwiRunner() {
