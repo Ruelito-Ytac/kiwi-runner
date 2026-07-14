@@ -150,4 +150,48 @@ describe("mechanic safety invariants", () => {
       }
     }
   });
+
+  it("keeps coins/keys out of crusher slam zones, spikes, and dropper columns", () => {
+    const overlap = (
+      a: { x: number; y: number; w: number; h: number },
+      b: { x: number; y: number; w: number; h: number },
+    ) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+    const bad: string[] = [];
+    for (const lv of LEVELS) {
+      const items = [
+        ...lv.coins.map((c) => ({
+          kind: "coin",
+          x: c.x,
+          y: c.y,
+          box: { x: c.x - 13, y: c.y - 13, w: 26, h: 26 },
+        })),
+        ...(lv.keys ?? []).map((k) => ({
+          kind: "key",
+          x: k.x,
+          y: k.y,
+          box: { x: k.x - 14, y: k.y - 14, w: 28, h: 28 },
+        })),
+      ];
+      const hazards = [
+        // a crusher sweeps its whole slam column from the raised top to the floor
+        ...(lv.crushers ?? []).map((c) => ({
+          what: `crusher@${c.x}`,
+          box: { x: c.x, y: c.y, w: c.w, h: c.range + c.h },
+        })),
+        ...lv.hazards
+          .filter((h) => h.type === "spike")
+          .map((s) => ({ what: `spike@${s.x}`, box: { x: s.x, y: s.y, w: s.w, h: s.h } })),
+        // a dropper falls straight down its column to the ground
+        ...(lv.droppers ?? []).map((d) => ({
+          what: `dropper@${d.x}`,
+          box: { x: d.x, y: d.y, w: d.w, h: GROUND_Y - d.y },
+        })),
+      ];
+      for (const c of items)
+        for (const hz of hazards)
+          if (overlap(c.box, hz.box))
+            bad.push(`L${lv.id}: ${c.kind}(${c.x},${c.y}) inside ${hz.what}`);
+    }
+    expect(bad, `\n${bad.join("\n")}\n`).toEqual([]);
+  });
 });
