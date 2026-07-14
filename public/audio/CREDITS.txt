@@ -1,0 +1,16 @@
+Kiwi Runner — audio credits
+============================
+
+Sound effects (jump.mp3, stomp.mp3, coin.mp3, death.mp3)
+  Kenney "Digital Audio" pack — Creative Commons Zero (CC0 1.0, public domain).
+  Source: https://kenney.nl/assets/digital-audio  (no attribution required;
+  credited here anyway). Downloaded from the CC0 mirror
+  github.com/Boyquotes/kenney-digital-audio-for-godot and transcoded to MP3.
+    jump  <- phase_jump_1     coin  <- pep_sound_1
+    stomp <- zap_two_tone     death <- low_down
+
+Background music (music-*.mp3, one per theme)
+  Synthesized locally for this project (a small chiptune generator — bass +
+  square/triangle arpeggio + soft groove over a per-theme chord progression).
+  Original, license-free. Swap in your own tracks by replacing these files
+  (same names) — the audio manager loads them by path, no code change needed.

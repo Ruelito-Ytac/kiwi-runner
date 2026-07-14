@@ -72,6 +72,23 @@ const CRUSH_LETHAL_TO = 0.8; // …and where the retract begins (safe again afte
 const DROP_TELEGRAPH = 0.32; // seconds a rock shakes in place before it lets go
 const DROP_RESET = 2.4; // seconds a shattered rock waits before re-arming
 const SURF_EPS = 8; // px tolerance for "feet resting on this surface"
+const ONEWAY_MAX_H = 60; // platforms this thin or thinner are jump-through (blocks, not ground)
+
+// Stomp (jump on a mob's head, Mario-style) + death sequence tuning.
+const STOMP_BOUNCE = -560; // upward pop after a successful stomp
+const STOMP_SCORE = 200; // points per defeated mob
+const STOMP_TOP_FRAC = 0.6; // feet must land in the upper 60% of the mob to stomp
+const DEATH_TIME = 1.1; // seconds the death animation plays before resolving
+const DEATH_HOP_V = -720; // the classic pop-up before the fall (skipped for pit deaths)
+const PARTICLE_GRAVITY = 900; // px/s^2 on feather/puff particles
+
+// Jump VFX (feet-anchored animated sprites) — on-screen widths + play durations.
+const FX_TAKEOFF_W = 104;
+const FX_TAKEOFF_DUR = 0.34; // ground-jump dust
+const FX_LAND_W = 104;
+const FX_LAND_DUR = 0.36; // landing dust
+const FX_DJUMP_W = 118;
+const FX_DJUMP_DUR = 0.3; // air/double-jump burst
 
 /* ---------------------------------------------------------- theme palettes */
 
@@ -173,6 +190,9 @@ export type HudState = {
 
 export type Outcome = "levelComplete" | "gameOver" | "victory";
 
+/** One-shot sound cues the engine emits; the host plays the matching clip. */
+export type SfxName = "jump" | "coin" | "stomp" | "death";
+
 export type GameCallbacks = {
   onHud: (h: HudState) => void;
   onOutcome: (
@@ -181,6 +201,7 @@ export type GameCallbacks = {
   ) => void;
   onHint: (msg: string | null) => void;
   onPauseRequest: () => void;
+  onSfx?: (name: SfxName) => void; // optional: host plays the sound
 };
 
 /** Processed sprite canvas plus the kiwi's measured vertical content bounds, so
@@ -273,6 +294,10 @@ export type GameAssets = {
   floorMid: HTMLImageElement | null; // Floor_02_middle_reusable — seamless tile
   floorEnd: HTMLImageElement | null; // Floor_03_end — right cap (grass drapes right)
   platform: HTMLImageElement | null; // Platform_Grass — rounded floating platforms/ledges
+  // Jump VFX frame sequences (empty array = missing → the effect just doesn't draw)
+  jumpTakeoff: HTMLImageElement[]; // ground-jump dust (Jump/take_off)
+  jumpLand: HTMLImageElement[]; // landing dust (Jump/land)
+  doubleJump: HTMLImageElement[]; // air-jump burst (Double Jump)
 };
 
 function loadImage(src: string): Promise<HTMLImageElement | null> {
@@ -285,6 +310,21 @@ function loadImage(src: string): Promise<HTMLImageElement | null> {
     };
     img.src = src;
   });
+}
+
+/** Load a numbered frame sequence (e.g. `${prefix}01.png`..). Missing frames are
+ *  dropped, so a partly-missing effect still plays with whatever loaded. */
+async function loadFrames(
+  prefix: string,
+  count: number,
+  pad = 2,
+): Promise<HTMLImageElement[]> {
+  const imgs = await Promise.all(
+    Array.from({ length: count }, (_, i) =>
+      loadImage(`${prefix}${String(i + 1).padStart(pad, "0")}.png`),
+    ),
+  );
+  return imgs.filter((x): x is HTMLImageElement => x !== null);
 }
 
 /** Load the idle kiwi and measure its opaque bounding box (alpha > 16) so the
@@ -333,6 +373,9 @@ export async function loadAssets(): Promise<GameAssets> {
     floorMid,
     floorEnd,
     platform,
+    jumpTakeoff,
+    jumpLand,
+    doubleJump,
   ] = await Promise.all([
     loadIdleSprite(),
     loadImage("/Cloud_Big.png"),
@@ -342,6 +385,9 @@ export async function loadAssets(): Promise<GameAssets> {
     loadImage("/Floor_02_middle_reusable.png"),
     loadImage("/Floor_03_end.png"),
     loadImage("/Platform_Grass.png"),
+    loadFrames("/Jump/take_off/take_off_", 7),
+    loadFrames("/Jump/land/land_", 8),
+    loadFrames("/Double Jump/", 4),
   ]);
   return {
     idle,
@@ -352,6 +398,9 @@ export async function loadAssets(): Promise<GameAssets> {
     floorMid,
     floorEnd,
     platform,
+    jumpTakeoff,
+    jumpLand,
+    doubleJump,
   };
 }
 
@@ -378,8 +427,38 @@ type PlayerState = {
 };
 
 type Coin = { x: number; y: number; collected: boolean; phase: number };
-type EnemyState = Enemy & { originX: number; dir: 1 | -1 };
-type FlyerState = Flyer & { originX: number; y0: number; dir: 1 | -1 };
+type EnemyState = Enemy & { originX: number; dir: 1 | -1; dead: boolean };
+type FlyerState = Flyer & {
+  originX: number;
+  y0: number;
+  dir: 1 | -1;
+  dead: boolean;
+};
+/** An animated sprite effect that plays its frames once (jump dust / air burst).
+ *  Placed at a feet anchor in world coordinates so it stays put as the world
+ *  scrolls. */
+type SpriteFx = {
+  frames: HTMLImageElement[];
+  x: number; // feet centre (world x)
+  y: number; // feet line (world y)
+  t: number;
+  dur: number;
+  w: number; // on-screen width; height follows the frame aspect
+  anchor: "bottom" | "center";
+};
+
+/** A short-lived visual particle (death feathers, stomp puff). */
+type Particle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+  size: number;
+  color: string;
+  spin: number;
+};
 type MoverState = MovingPlatform & {
   baseX: number;
   baseY: number;
@@ -450,6 +529,10 @@ export class KiwiGame {
   private player: PlayerState = blankPlayer();
   private camX = 0;
   private time = 0;
+  private particles: Particle[] = [];
+  private effects: SpriteFx[] = []; // active jump/land VFX sprites
+  private deathT = 0; // >0 = the death animation is playing (world frozen)
+  private deathHop = false; // true = pop-up death; false = pit death (already fell)
 
   private status: "idle" | "playing" | "over" = "idle";
   private running = false;
@@ -462,6 +545,7 @@ export class KiwiGame {
   private keyHandler: (e: KeyboardEvent) => void;
   private keyUpHandler: (e: KeyboardEvent) => void;
   private resizeHandler: () => void;
+  private fsHandler: () => void;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -484,6 +568,11 @@ export class KiwiGame {
     this.setupCanvas(canvas);
     this.resizeHandler = () => this.setupCanvas(canvas);
     window.addEventListener("resize", this.resizeHandler);
+    // Re-measure after a fullscreen change; wait one frame so the new layout is
+    // settled before we read the canvas's displayed size.
+    this.fsHandler = () =>
+      requestAnimationFrame(() => this.setupCanvas(canvas));
+    document.addEventListener("fullscreenchange", this.fsHandler);
 
     this.keyHandler = (e) => this.onKeyDown(e);
     this.keyUpHandler = (e) => this.onKeyUp(e);
@@ -491,13 +580,35 @@ export class KiwiGame {
     window.addEventListener("keyup", this.keyUpHandler);
   }
 
-  /** Size the drawing buffer for the device pixel ratio; we always draw in
-   *  logical 960x540 coordinates and let CSS scale the element to fit. */
+  /** Fit the largest 16:9 box inside the frame, use it as the canvas's CSS size,
+   *  and match the backing store to it × the device pixel ratio. This keeps the
+   *  render 1:1 with the screen (crisp at any size, windowed or fullscreen),
+   *  undistorted, and letterboxed on black when the frame isn't 16:9. We always
+   *  draw in logical 960×540 coordinates, scaled uniformly onto the backing. */
   private setupCanvas(canvas: HTMLCanvasElement) {
-    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = LOGICAL_W * this.dpr;
-    canvas.height = LOGICAL_H * this.dpr;
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.dpr = dpr;
+    const frame = canvas.parentElement;
+    const fw = frame?.clientWidth || LOGICAL_W; // fall back before first layout
+    const fh = frame?.clientHeight || LOGICAL_H;
+    let cssW = fw;
+    let cssH = (fw * LOGICAL_H) / LOGICAL_W;
+    if (cssH > fh) {
+      cssH = fh;
+      cssW = (fh * LOGICAL_W) / LOGICAL_H;
+    }
+    canvas.style.width = `${cssW}px`;
+    canvas.style.height = `${cssH}px`;
+    canvas.width = Math.max(1, Math.round(cssW * dpr));
+    canvas.height = Math.max(1, Math.round(cssH * dpr));
+    this.ctx.setTransform(
+      canvas.width / LOGICAL_W,
+      0,
+      0,
+      canvas.height / LOGICAL_H,
+      0,
+      0,
+    );
     if (this.status !== "idle") this.render();
   }
 
@@ -538,6 +649,7 @@ export class KiwiGame {
     this.pause();
     this.status = "idle";
     window.removeEventListener("resize", this.resizeHandler);
+    document.removeEventListener("fullscreenchange", this.fsHandler);
     window.removeEventListener("keydown", this.keyHandler);
     window.removeEventListener("keyup", this.keyUpHandler);
   }
@@ -636,10 +748,10 @@ export class KiwiGame {
     }));
     this.enemies = lv.hazards
       .filter((h): h is Enemy => h.type === "enemy")
-      .map((e) => ({ ...e, originX: e.x, dir: 1 }));
+      .map((e) => ({ ...e, originX: e.x, dir: 1 as const, dead: false }));
     this.flyers = lv.hazards
       .filter((h): h is Flyer => h.type === "flyer")
-      .map((f) => ({ ...f, originX: f.x, y0: f.y, dir: 1 }));
+      .map((f) => ({ ...f, originX: f.x, y0: f.y, dir: 1 as const, dead: false }));
     // Copy spikes (so clamping never mutates the shared level data) and pull
     // any thorn off the start/end floor caps into the flat middle of its slab,
     // so it never renders hanging over a ledge.
@@ -702,6 +814,10 @@ export class KiwiGame {
     this.player.x = lv.spawn.x;
     this.player.y = lv.spawn.y;
     this.camX = 0;
+    this.particles = [];
+    this.effects = [];
+    this.deathT = 0;
+    this.deathHop = false;
     this.input.left = false;
     this.input.right = false;
     this.cb.onHint(null);
@@ -749,6 +865,7 @@ export class KiwiGame {
 
   private step(dt: number) {
     this.time += dt;
+    if (this.deathT > 0) return this.updateDeath(dt); // world frozen mid-death
     const p = this.player;
 
     // timers
@@ -785,11 +902,20 @@ export class KiwiGame {
         p.onGround = false;
         p.coyote = 0;
         p.jumpBuffer = 0;
+        this.cb.onSfx?.("jump");
+        this.spawnFx(
+          this.assets.jumpTakeoff,
+          FX_TAKEOFF_W,
+          FX_TAKEOFF_DUR,
+          "bottom",
+        );
       } else if (p.jumpBuffer > 0 && !p.onGround && p.airJumpsLeft > 0) {
         p.vy = JUMP_VELOCITY; // double jump — crisp reset of vertical velocity
         p.airJumpsLeft--;
         p.jumpBuffer = 0;
         p.squash = 0.1;
+        this.cb.onSfx?.("jump");
+        this.spawnFx(this.assets.doubleJump, FX_DJUMP_W, FX_DJUMP_DUR, "center");
       }
 
       // gravity
@@ -823,7 +949,10 @@ export class KiwiGame {
       p.coyote = this.diff.coyoteMs / 1000;
       p.airJumpsLeft = AIR_JUMPS;
       p.dashAir = false;
-      if (!wasOnGround) p.squash = 0.12;
+      if (!wasOnGround) {
+        p.squash = 0.12;
+        this.spawnFx(this.assets.jumpLand, FX_LAND_W, FX_LAND_DUR, "bottom");
+      }
     } else {
       p.coyote = Math.max(0, p.coyote - dt);
     }
@@ -835,6 +964,7 @@ export class KiwiGame {
 
     // enemies patrol
     for (const e of this.enemies) {
+      if (e.dead) continue;
       e.x += e.dir * e.speed * this.diff.enemySpeedMul * dt;
       if (e.x >= e.originX + e.patrol) {
         e.x = e.originX + e.patrol;
@@ -847,6 +977,7 @@ export class KiwiGame {
 
     // flyers patrol horizontally and bob on a sine wave
     for (const f of this.flyers) {
+      if (f.dead) continue;
       f.x += f.dir * f.speed * this.diff.enemySpeedMul * dt;
       if (f.x >= f.originX + f.patrol) {
         f.x = f.originX + f.patrol;
@@ -870,9 +1001,11 @@ export class KiwiGame {
 
     this.collectCoins();
     this.collectKeys();
-    if (this.checkHazards()) return; // a hit may end the run
+    if (this.checkHazards()) return; // a hit may start the death sequence
     this.checkFinish();
 
+    this.updateParticles(dt);
+    this.updateEffects(dt);
     this.pushHud();
   }
 
@@ -897,6 +1030,7 @@ export class KiwiGame {
         this.levelCoins++;
         this.coins++;
         this.score += COIN_VALUE;
+        this.cb.onSfx?.("coin");
       }
     }
   }
@@ -906,7 +1040,11 @@ export class KiwiGame {
    *  pushable boxes, and closed barriers. Crushers are NOT here — they are pure
    *  timed hazards you pass under, not surfaces you ride. */
   private solids(): Rect[] {
-    const s: Rect[] = this.platforms.slice();
+    // Floating blocks (thin platforms) are one-way: you jump up through them and
+    // land on top, Mario-style. Thick ground slabs stay fully solid.
+    const s: Rect[] = this.platforms.map((p) =>
+      p.h <= ONEWAY_MAX_H ? { ...p, oneWay: true } : { ...p },
+    );
     for (const m of this.movers) s.push({ x: m.x, y: m.y, w: m.w, h: m.h });
     for (const b of this.belts) s.push({ x: b.x, y: b.y, w: b.w, h: b.h });
     for (const c of this.crumblers)
@@ -1025,6 +1163,8 @@ export class KiwiGame {
         p.onGround = false;
         p.coyote = 0;
         p.squash = 0.14;
+        this.cb.onSfx?.("jump");
+        this.spawnFx(this.assets.jumpTakeoff, FX_TAKEOFF_W, FX_TAKEOFF_DUR, "bottom");
         break;
       }
     }
@@ -1209,71 +1349,235 @@ export class KiwiGame {
     }
   }
 
-  /** @returns true if the run/level ended as a result of a hit. */
+  /** @returns true if the step should bail — a hit started the death sequence. */
   private checkHazards(): boolean {
     const p = this.player;
     // pit
-    if (p.y > DEATH_Y) return this.takeHit();
+    if (p.y > DEATH_Y) return this.startDeath(true);
     if (p.invuln > 0) return false;
 
     const pr = this.playerRect();
     for (const s of this.spikes) {
       // slightly forgiving spike hitbox
       if (aabb(pr, { x: s.x + 4, y: s.y + 6, w: s.w - 8, h: s.h - 6 }))
-        return this.takeHit();
+        return this.startDeath(false);
     }
+    // enemies + flyers: a descending landing on the head is a STOMP (kill +
+    // bounce); any other contact costs a life.
     for (const e of this.enemies) {
-      if (aabb(pr, { x: e.x + 4, y: e.y + 4, w: e.w - 8, h: e.h - 6 }))
-        return this.takeHit();
+      if (e.dead) continue;
+      if (!aabb(pr, { x: e.x + 4, y: e.y + 4, w: e.w - 8, h: e.h - 6 })) continue;
+      if (this.isStomp(e.y, e.h)) this.stompMob(e);
+      else return this.startDeath(false);
     }
     for (const f of this.flyers) {
-      if (aabb(pr, { x: f.x + 4, y: f.y + 4, w: f.w - 8, h: f.h - 8 }))
-        return this.takeHit();
+      if (f.dead) continue;
+      if (!aabb(pr, { x: f.x + 4, y: f.y + 4, w: f.w - 8, h: f.h - 8 })) continue;
+      if (this.isStomp(f.y, f.h)) this.stompMob(f);
+      else return this.startDeath(false);
     }
     for (const c of this.crushers) {
       // lethal only during the slam + bottom hold (safe while raised/retracting)
       if (c.cyclePos < CRUSH_LETHAL_FROM || c.cyclePos > CRUSH_LETHAL_TO) continue;
       if (aabb(pr, { x: c.x + 3, y: c.y + 3, w: c.w - 6, h: c.h - 3 }))
-        return this.takeHit();
+        return this.startDeath(false);
     }
     for (const d of this.droppers) {
       if (d.stage !== "falling") continue;
       if (aabb(pr, { x: d.x + 4, y: d.curY + 4, w: d.w - 8, h: d.h - 6 }))
-        return this.takeHit();
+        return this.startDeath(false);
     }
     return false;
   }
 
-  /** Apply one hit. @returns true if the loop was stopped (game over). */
-  private takeHit(): boolean {
+  /** True when the kiwi is descending onto the upper part of a mob (head-bop). */
+  private isStomp(topY: number, h: number): boolean {
+    const p = this.player;
+    return p.vy > 0 && p.y + PLAYER.h <= topY + h * STOMP_TOP_FRAC;
+  }
+
+  /** Defeat the mob under the kiwi's feet: kill it, bounce, score, puff + sfx. */
+  private stompMob(m: { dead: boolean; x: number; y: number; w: number; h: number }) {
+    m.dead = true;
+    const p = this.player;
+    p.vy = STOMP_BOUNCE;
+    p.onGround = false;
+    p.airJumpsLeft = AIR_JUMPS; // refill so stomps chain into more stomps
+    p.dashAir = false;
+    p.squash = 0.14;
+    this.score += STOMP_SCORE;
+    this.emitPuff(m.x + m.w / 2, m.y + m.h / 2);
+    this.cb.onSfx?.("stomp");
+  }
+
+  /** Begin the death animation (a pop-up + feather burst, or just a burst for a
+   *  pit fall). @returns true so `checkHazards` bails the rest of the step. */
+  private startDeath(isPit: boolean): boolean {
+    if (this.deathT > 0) return true; // already dying
     this.lives--;
+    this.cb.onSfx?.("death");
+    this.emitDeathBurst();
+    this.deathHop = !isPit;
+    if (this.deathHop) {
+      const p = this.player;
+      p.vy = DEATH_HOP_V; // the classic pop before the fall
+      p.vx = 0;
+      p.onGround = false;
+    }
+    this.deathT = DEATH_TIME;
+    this.pushHud(true);
+    return true;
+  }
+
+  /** Play out the death animation, then resolve it (world stays frozen). */
+  private updateDeath(dt: number) {
+    this.deathT -= dt;
+    if (this.deathHop) {
+      const p = this.player;
+      p.vy = Math.min(p.vy + GRAVITY * dt, MAX_FALL);
+      p.y += p.vy * dt; // free fall off-screen — no collision during death
+    }
+    this.updateParticles(dt);
+    this.updateEffects(dt);
+    this.pushHud();
+    if (this.deathT <= 0) this.resolveDeath();
+  }
+
+  /** Apply the consequence once the death animation has finished. */
+  private resolveDeath() {
+    this.deathT = 0;
+    this.particles = [];
     if (this.lives <= 0) {
       this.gameOver();
-      return true;
+      return;
     }
     if (this.diff.restartLevelOnHit) {
       // Hard: a hit sends you back to the start of the level.
       this.dropLevelCoins();
       this.buildLevel(this.index);
     } else {
-      // Easy/Medium: respawn at the level start, mobs reset, coins kept.
+      // Easy/Medium: respawn at the start; mobs reset + revived, coins kept.
       for (const e of this.enemies) {
         e.x = e.originX;
         e.dir = 1;
+        e.dead = false;
       }
       for (const f of this.flyers) {
         f.x = f.originX;
         f.dir = 1;
+        f.dead = false;
       }
       this.resetMechanicsForRespawn();
+      this.player = blankPlayer();
       this.player.x = this.level.spawn.x;
       this.player.y = this.level.spawn.y;
-      this.player.vx = 0;
-      this.player.vy = 0;
     }
     this.player.invuln = INVULN_S;
     this.pushHud(true);
-    return false;
+  }
+
+  /* ------------------------------------------------------------- particles */
+
+  /** A burst of kiwi feathers where the kiwi died. */
+  private emitDeathBurst() {
+    const cx = this.player.x + PLAYER.w / 2;
+    const cy = this.player.y + PLAYER.h / 2;
+    const colors = ["#7a4a2b", "#a9743f", "#e8dcc0", "#ffffff"];
+    for (let i = 0; i < 16; i++) {
+      const a = (Math.PI * 2 * i) / 16 + Math.random() * 0.4;
+      const sp = 120 + Math.random() * 160;
+      this.particles.push({
+        x: cx,
+        y: cy,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp - 120,
+        life: 0.9 + Math.random() * 0.5,
+        maxLife: 1.4,
+        size: 4 + Math.random() * 4,
+        color: colors[i % colors.length]!,
+        spin: (Math.random() - 0.5) * 12,
+      });
+    }
+  }
+
+  /** A small dust puff where a mob was stomped. */
+  private emitPuff(cx: number, cy: number) {
+    for (let i = 0; i < 8; i++) {
+      const a = (Math.PI * 2 * i) / 8;
+      const sp = 60 + Math.random() * 90;
+      this.particles.push({
+        x: cx,
+        y: cy,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp - 40,
+        life: 0.35 + Math.random() * 0.25,
+        maxLife: 0.6,
+        size: 3 + Math.random() * 3,
+        color: i % 2 ? "#ffffff" : "#ffe6a8",
+        spin: 0,
+      });
+    }
+  }
+
+  private updateParticles(dt: number) {
+    if (this.particles.length === 0) return;
+    for (const pt of this.particles) {
+      pt.vy += PARTICLE_GRAVITY * dt;
+      pt.x += pt.vx * dt;
+      pt.y += pt.vy * dt;
+      pt.life -= dt;
+    }
+    this.particles = this.particles.filter((pt) => pt.life > 0);
+  }
+
+  /* ------------------------------------------------------- jump VFX sprites */
+
+  private feetX(): number {
+    return this.player.x + PLAYER.w / 2;
+  }
+  private feetY(): number {
+    return this.player.y + PLAYER.h;
+  }
+
+  /** Play a one-shot animated effect at the kiwi's feet. */
+  private spawnFx(
+    frames: HTMLImageElement[],
+    w: number,
+    dur: number,
+    anchor: "bottom" | "center",
+  ) {
+    if (frames.length === 0) return; // art missing → no effect, game unaffected
+    this.effects.push({
+      frames,
+      x: this.feetX(),
+      y: this.feetY(),
+      t: 0,
+      dur,
+      w,
+      anchor,
+    });
+  }
+
+  private updateEffects(dt: number) {
+    if (this.effects.length === 0) return;
+    for (const e of this.effects) e.t += dt;
+    this.effects = this.effects.filter((e) => e.t < e.dur);
+  }
+
+  private drawEffects() {
+    const ctx = this.ctx;
+    for (const e of this.effects) {
+      const idx = Math.min(
+        e.frames.length - 1,
+        Math.floor((e.t / e.dur) * e.frames.length),
+      );
+      const img = e.frames[idx]!;
+      if (e.x + e.w < this.camX || e.x - e.w > this.camX + LOGICAL_W) continue;
+      const h = e.w * (img.height / img.width);
+      const dx = e.x - e.w / 2;
+      const dy = e.anchor === "bottom" ? e.y - h : e.y - h / 2;
+      ctx.drawImage(img, dx, dy, e.w, h);
+    }
   }
 
   private checkFinish() {
@@ -1374,7 +1678,9 @@ export class KiwiGame {
     this.drawFlyers();
     this.drawWind();
     this.drawFinish();
+    this.drawEffects();
     this.drawPlayer();
+    this.drawParticles();
     ctx.restore();
   }
 
@@ -1569,6 +1875,7 @@ export class KiwiGame {
   private drawEnemies() {
     const ctx = this.ctx;
     for (const e of this.enemies) {
+      if (e.dead) continue;
       const bob = Math.sin(this.time * 6 + e.originX) * 2;
       const cx = e.x + e.w / 2;
       const cy = e.y + e.h / 2 + bob;
@@ -1594,6 +1901,7 @@ export class KiwiGame {
   private drawFlyers() {
     const ctx = this.ctx;
     for (const f of this.flyers) {
+      if (f.dead) continue;
       if (f.x + f.w < this.camX || f.x > this.camX + LOGICAL_W) continue;
       const cx = f.x + f.w / 2;
       const cy = f.y + f.h / 2;
@@ -2006,11 +2314,13 @@ export class KiwiGame {
 
     const cx = p.x + PLAYER.w / 2;
     const footY = p.y + PLAYER.h + bob;
+    // death: tumble faster as the animation plays out
+    const spin = this.deathT > 0 ? (DEATH_TIME - this.deathT) * 14 : 0;
 
     ctx.save();
     ctx.translate(cx, footY);
     ctx.scale(p.facing * sx, sy);
-    ctx.rotate(p.facing === 1 ? tilt : -tilt);
+    ctx.rotate((p.facing === 1 ? tilt : -tilt) + spin);
 
     if (isIdle && this.assets.idle) {
       const s = this.assets.idle;
@@ -2046,6 +2356,27 @@ export class KiwiGame {
       ctx.fill();
     }
     ctx.restore();
+  }
+
+  /** Death feathers (spinning flecks) and stomp puffs (round dust), fading out. */
+  private drawParticles() {
+    const ctx = this.ctx;
+    for (const pt of this.particles) {
+      ctx.globalAlpha = clamp(pt.life / pt.maxLife, 0, 1);
+      ctx.fillStyle = pt.color;
+      if (pt.spin) {
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(pt.life * pt.spin);
+        ctx.fillRect(-pt.size / 2, -pt.size / 4, pt.size, pt.size / 2); // feather
+        ctx.restore();
+      } else {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2); // dust puff
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
   }
 }
 

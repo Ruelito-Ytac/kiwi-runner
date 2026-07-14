@@ -8,7 +8,15 @@
  * which is what prevents tunnelling at high speed.
  */
 
-export type Rect = { x: number; y: number; w: number; h: number };
+export type Rect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** One-way ("jump-through") platform: only catches a downward landing from
+   *  above; the body passes freely up through it and sideways. */
+  oneWay?: boolean;
+};
 
 /**
  * Crusher vertical profile over one cycle. `t` in [0,1) → 0 (fully raised, the
@@ -63,6 +71,7 @@ export function moveAndCollide(
   x += dx;
   if (dx !== 0) {
     for (const s of solids) {
+      if (s.oneWay) continue; // jump-through platforms never block sideways
       if (aabb({ x, y, w, h }, s)) {
         // Push out to the side we came from.
         x = dx > 0 ? s.x - w : s.x + s.w;
@@ -71,9 +80,14 @@ export function moveAndCollide(
   }
 
   // --- Vertical ---
+  const yBefore = y; // pre-move top, for the one-way "came from above?" test
   y += dy;
   if (dy !== 0) {
     for (const s of solids) {
+      // One-way platform: catch only a downward landing whose feet were at or
+      // above the platform top before this step. Never blocks a rising body or
+      // one already overlapping from below/the side.
+      if (s.oneWay && (dy <= 0 || yBefore + h > s.y + 1)) continue;
       if (aabb({ x, y, w, h }, s)) {
         if (dy > 0) {
           // Falling: land on top.
