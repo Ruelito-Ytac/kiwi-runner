@@ -15,7 +15,11 @@ pits, every level layers in **2–3 environment mechanics**:
   along), **crushers** (slam down on a timer — mind the safe window)
 - **falling rocks** (let go when you pass beneath), **ice** (slippery momentum),
   **wind gusts** (shove you mid-run and mid-jump)
-- **push-crates** and **pressure-plate → barrier** gates
+- **weight-plate crate puzzles** (park the crate to hold a door open / a beam
+  off — you can't stand on it *and* cross)
+- **laser gates** (timed on/off, or cut by a switch/crate), **levers & timed
+  doors** (race them, or jam open with a crate), and **updraft fans** (ride the
+  column up a shaft)
 
 Mobs are **stomped Mario-style** (land on a head to defeat it — any other touch
 hurts), floating ledges are **jump-through** (leap up from below, land on top),
@@ -100,8 +104,10 @@ scrolls right. `GROUND_Y = 480` is the ground surface. Helpers are provided:
   ice:      [ ice(3200, 300) ],                   // slippery patch (x, width, surface y)
   wind:     [ wind(3400, 300, 500, 180, -110) ],  // gust zone (push ±px/s, < 240)
   boxes:    [ box(3800) ],                         // pushable crate (settles by gravity)
-  switches: [ plate(4000, GROUND_Y, 0, 64, true) ],// opens barriers[0]; latch = one-shot
-  barriers: [ barrier(4300, 120, 24, GROUND_Y - 120) ], // solid until its switch fires
+  switches: [ weightPlate(4000, 0), lever(4600, 1, 2500) ], // hold-down plate / timed lever
+  barriers: [ barrier(4300, 120, 24, GROUND_Y - 120), barrier(4800, 120, 24, GROUND_Y - 120) ],
+  lasers:   [ laser(5000, 150, 10, 330, 2, 0, 0.5), linkedLaser(5200, 150, 10, 330, 0) ], // timed / switch-cut
+  fans:     [ fan(5400, 140, 80, 300, 520) ],      // updraft column (ride up)
 }
 ```
 
@@ -123,10 +129,18 @@ scrolls right. `GROUND_Y = 480` is the ground surface. Helpers are provided:
   lethally, and re-arms; **`ice`** swaps snappy control for momentum while you
   stand on it; **`wind`** adds a signed horizontal push inside its rectangle (in
   the air too — keep `|push|` below 240).
-- **`box` + `plate`/`barrier`:** shove a crate onto a pressure `plate` (or step on
-  it) to open the `barrier` it indexes. A `latch` plate stays open once triggered
-  (use it on the main path to avoid soft-locks); a hold-down plate needs weight
-  kept on it.
+- **`box` + `weightPlate`/`barrier`:** shove a crate onto a `weightPlate` (a
+  hold-down plate) to open the `barrier` it indexes — you can't stand on it *and*
+  cross, so the crate is required. Place the plate just before the barrier so the
+  crate stops on it against the closed door.
+- **`lever` + `barrier`:** a `lever` trips on touch; it latches the barrier open,
+  or with `openMs` re-closes it on a timer (race it, or jam it open with a crate).
+- **`laser` / `linkedLaser`:** a lethal beam. `laser` blinks on/off on a `period`
+  (run the OFF window — tall enough that it can't be jumped over); `linkedLaser`'s
+  `link` is a switch index — it's ON only while that switch is inactive, so a
+  crate on a plate (or a thrown lever) cuts it.
+- **`fan`:** an updraft column — inside it the kiwi rides up at ~`lift` px/s; build
+  a shaft up to a ledge. Its base sits just above the ground so you hop in.
 - **Top finishes:** set `finish.y` high (e.g. `220`) and build a route up to it —
   the finish only triggers near the flag's height, so you must actually climb.
 - Every level's `worldWidth` is **non-decreasing** by design (later levels are
@@ -185,7 +199,8 @@ jump buffer), not by mutating level geometry.
   colours (tint them to `pal.far`/`pal.near` if dark themes need it).
 - **Coins, keys, springs, movers, spikes, enemies, flyers, the gate, and the
   finish flag** — plus every environment mechanic (crumblers, belts, crushers,
-  droppers, ice, wind, crates, plates, barriers) — are drawn procedurally on the
+  droppers, ice, wind, crates, plates, barriers, lasers, fans, levers) — are drawn
+  procedurally on the
   canvas. The **jump VFX** are the only sprite-sheet effects: feet-anchored frame
   sequences in `public/Jump/take_off` (ground-jump dust), `public/Jump/land`
   (landing dust), and `public/Double Jump` (air-jump burst), loaded by

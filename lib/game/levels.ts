@@ -116,18 +116,64 @@ const wind = (x: number, y: number, w: number, h: number, push: number) => ({
 });
 /** A pushable crate; defaults to resting on the ground. */
 const box = (x: number, y = GROUND_Y - 44, w = 44, h = 44) => ({ x, y, w, h });
-/** A pressure plate on a surface at `y` that opens `barriers[barrier]`;
- *  `latch` makes it a one-shot lever instead of a hold-down plate. */
-const plate = (x: number, y: number, barrier: number, w = 64, latch = false) => ({
+/** A steel barrier, opened by its switch (index-linked via a switch's `barrier`). */
+const barrier = (x: number, y: number, w: number, h: number) => ({ x, y, w, h });
+
+/** A timed laser: ON `duty` of each `period`s cycle (offset by `phase`). A tall
+ *  thin rect is a vertical gate beam (run the OFF window); wide + short is a
+ *  horizontal beam (float/jump through when off). Tall enough that it can't be
+ *  jumped over, so timing genuinely matters. */
+const laser = (
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  period: number,
+  phase = 0,
+  duty = 0.5,
+) => ({ x, y, w, h, period, phase, duty });
+/** A laser wired to `switches[link]`: ON only while that switch is INACTIVE, so
+ *  a crate on a weight plate (or a thrown lever) cuts the beam. */
+const linkedLaser = (x: number, y: number, w: number, h: number, link: number) => ({
+  x,
+  y,
+  w,
+  h,
+  link,
+});
+/** A floor lever, tripped by touch. Opens `barrier`; with `openMs` the barrier
+ *  re-closes that many ms after each throw (a timed door to race), otherwise it
+ *  latches open for good. */
+const lever = (x: number, barrier: number, openMs?: number, y = GROUND_Y) => ({
+  x,
+  y: y - 48,
+  w: 24,
+  h: 48,
+  barrier,
+  mode: "lever" as const,
+  ...(openMs ? { openMs } : { latch: true }),
+});
+/** A hold-down weight plate: needs the kiwi or a crate resting on it to stay
+ *  active. Drop a crate on it to hold a door open / a laser off while you cross
+ *  (you can't stand on it AND be across — the crate is required). Omit `barrier`
+ *  when it only drives a laser. */
+const weightPlate = (x: number, barrier?: number, y = GROUND_Y, w = 56) => ({
   x,
   y,
   w,
   h: 10,
-  barrier,
-  latch,
+  latch: false,
+  ...(barrier != null ? { barrier } : {}),
 });
-/** A steel barrier, opened by its plate (index-linked via `plate`'s barrier). */
-const barrier = (x: number, y: number, w: number, h: number) => ({ x, y, w, h });
+/** An updraft column: while inside, the kiwi is lifted and rises at up to `lift`
+ *  px/s — ride it up a shaft. */
+const fan = (x: number, y: number, w: number, h: number, lift = 500) => ({
+  x,
+  y,
+  w,
+  h,
+  lift,
+});
 
 export const LEVELS: Level[] = [
   // ---------------------------------------------------------------- Level 1
@@ -158,6 +204,9 @@ export const LEVELS: Level[] = [
     crumblers: [crumbler(1440, 372), crumbler(1600, 356)],
     // a gentle right-moving walkway: first taste of a conveyor
     belts: [belt(2740, GROUND_Y, 300, 1, 110)],
+    // throw the lever to open a door across the path — the gentlest intro
+    switches: [lever(1120, 0)],
+    barriers: [barrier(1230, 120, 22, GROUND_Y - 120)],
     coins: [
       ...coinRow(300, 430, 3),
       { x: 500, y: 344 },
@@ -216,6 +265,11 @@ export const LEVELS: Level[] = [
     crumblers: [crumbler(700, 405, 90), crumbler(1310, 405, 90)],
     // a right-moving walkway carries you across the mid stretch
     belts: [belt(2130, GROUND_Y, 300, 1, 120)],
+    // shove the crate onto the weight plate (it stops against the door) to hold
+    // the door open — the crate is required, then hop it and carry on
+    boxes: [box(2820)],
+    switches: [weightPlate(3000, 0)],
+    barriers: [barrier(3050, 120, 22, GROUND_Y - 120)],
     coins: [
       ...coinArc(300, 400, 3),
       { x: 560, y: 340 },
@@ -282,6 +336,11 @@ export const LEVELS: Level[] = [
     wind: [wind(1920, 300, 560, 180, -120), wind(4610, 300, 620, 180, -120)],
     // rockfall parked over clear columns; it drops when you run underneath
     droppers: [dropper(2300, 150), dropper(3450, 150), dropper(4900, 150)],
+    // a twin timed-laser gate — thread the OFF windows (too tall to jump over)
+    lasers: [
+      laser(3250, 150, 10, 330, 2.0, 0, 0.45),
+      laser(3420, 150, 10, 330, 2.0, 0.5, 0.45),
+    ],
     coins: [
       { x: 300, y: 336 },
       ...coinArc(590, 405, 3),
@@ -327,6 +386,7 @@ export const LEVELS: Level[] = [
       ground(1430, 400), // gap 150
       ground(1980, 300), // gap 280 → mover
       ground(2560, 900), // crusher gauntlet slab
+      block(2560, 150, 150, 20), // fan-lift bonus ledge (one-way)
       ground(3610, 700), // gap 150
       ground(4460, 1240), // staircase base + climb
       block(4600, 380), // staircase up to the top finish (first step on ground, 60px steps)
@@ -345,6 +405,8 @@ export const LEVELS: Level[] = [
     ],
     // crumbling ledges over solid ground — a timed bonus route, safe to miss
     crumblers: [crumbler(2620, 372), crumbler(3320, 360), crumbler(3980, 372)],
+    // an updraft shaft lifts you to the bonus ledge above the crusher slab
+    fans: [fan(2600, 150, 70, 330, 500)],
     coins: [
       { x: 360, y: 300 },
       { x: 360, y: 200 },
@@ -353,6 +415,8 @@ export const LEVELS: Level[] = [
       { x: 1550, y: 180 },
       ...coinArc(1700, 405, 3),
       { x: 2620, y: 344 },
+      { x: 2620, y: 128 }, // bonus coins on the fan-lift ledge
+      { x: 2680, y: 128 },
       ...coinRow(2890, 440, 2),
       { x: 3320, y: 332 },
       ...coinArc(3650, 405, 3),
@@ -401,6 +465,12 @@ export const LEVELS: Level[] = [
     ice: [ice(2400, 240), ice(4180, 360), ice(4820, 380), ice(5360, 360)],
     // an icy conveyor between the patches drags you back toward the gate
     belts: [belt(4600, GROUND_Y, 200, -1, 130)],
+    // past the gate: shove the crate onto the plate (it stops against the door)
+    // to open the door AND cut the laser beyond it — both fall to one crate
+    boxes: [box(4300)],
+    switches: [weightPlate(4520, 0)],
+    barriers: [barrier(4570, 150, 22, 330)],
+    lasers: [linkedLaser(4700, 150, 10, 330, 0)],
     coins: [
       ...coinArc(300, 400, 3),
       { x: 945, y: 310 },
@@ -463,6 +533,11 @@ export const LEVELS: Level[] = [
     // crumbling ledges (bonus, safe fall) and falling rocks over the gauntlet
     crumblers: [crumbler(2900, 372), crumbler(3700, 360)],
     droppers: [dropper(3200, 150), dropper(3980, 150)],
+    // a timed laser in the headwind, then a lever-timed door to race — the
+    // tailwind on the next slab helps you beat it. World 1's send-off
+    lasers: [laser(3050, 150, 10, 330, 1.8, 0, 0.5)],
+    switches: [lever(3650, 0, 2200)],
+    barriers: [barrier(3900, 120, 22, GROUND_Y - 120)],
     coins: [
       { x: 300, y: 300 },
       { x: 300, y: 200 },
@@ -534,8 +609,13 @@ export const LEVELS: Level[] = [
     belts: [belt(2500, GROUND_Y, 400, 1, 150), belt(3850, GROUND_Y, 380, 1, 150)],
     // crumbling coin-shortcuts over the first two pits
     crumblers: [crumbler(700, 405, 90), crumbler(1305, 405, 90)],
-    // a crate to shove aside (or hop) on the run to the flag
-    boxes: [box(5980)],
+    // a timed laser mid-belt (the belt flings you — time the OFF window)
+    lasers: [laser(2700, 150, 10, 330, 1.5, 0, 0.5)],
+    // a crate that finally MATTERS: shove it onto the plate (it stops against
+    // the door) to open the door blocking the way on
+    boxes: [box(4700)],
+    switches: [weightPlate(4950, 0)],
+    barriers: [barrier(5000, 120, 22, GROUND_Y - 120)],
     coins: [
       { x: 300, y: 300 },
       { x: 300, y: 240 },
@@ -605,6 +685,16 @@ export const LEVELS: Level[] = [
     droppers: [dropper(1600, 150), dropper(2400, 150), dropper(3200, 150)],
     crushers: [crusher(3800, 168, 252, 2.0, 0), crusher(5200, 168, 252, 1.9, 0.5)],
     belts: [belt(5500, GROUND_Y, 300, -1, 140)],
+    // two out-of-phase laser gates to thread early; a crate cuts a third on the
+    // home stretch (shove it onto the plate against the door)
+    lasers: [
+      laser(2300, 150, 10, 330, 1.8, 0, 0.45),
+      laser(2500, 150, 10, 330, 1.8, 0.5, 0.45),
+      linkedLaser(6120, 150, 10, 330, 0),
+    ],
+    boxes: [box(5820)],
+    switches: [weightPlate(5980, 0)],
+    barriers: [barrier(6030, 150, 22, 330)],
     coins: [
       ...coinArc(300, 400, 3),
       { x: 560, y: 336 },
@@ -667,6 +757,7 @@ export const LEVELS: Level[] = [
       block(4300, 368),
       block(5000, 360),
       block(5550, 372),
+      block(4380, 130, 110, 20), // fan-lift bonus ledge (one-way)
     ],
     movers: [
       moverX(720, 470, 120),
@@ -683,6 +774,10 @@ export const LEVELS: Level[] = [
     // crumbling stones tempt you over the pits; rockfall waits on clear columns
     crumblers: [crumbler(2600, 405, 90), crumbler(4650, 405, 90)],
     droppers: [dropper(4100, 150), dropper(5750, 150)],
+    // a timed laser gate on the ground, and an updraft shaft (hop into it) up to
+    // a bonus ledge in the dark
+    lasers: [laser(4200, 150, 10, 330, 1.9, 0, 0.5)],
+    fans: [fan(4400, 140, 80, 300, 520)],
     coins: [
       { x: 300, y: 300 },
       { x: 300, y: 200 },
@@ -694,6 +789,8 @@ export const LEVELS: Level[] = [
       { x: 2900, y: 340 },
       { x: 3560, y: 324 },
       { x: 4650, y: 380 },
+      { x: 4420, y: 108 }, // bonus coins on the fan-lift ledge
+      { x: 4460, y: 108 },
       { x: 5000, y: 324 },
       ...coinRow(5590, 440, 3),
       ...coinRow(6200, 440, 3),
@@ -745,9 +842,15 @@ export const LEVELS: Level[] = [
     // slick ice (clear of the pit edges) and a left-dragging icy conveyor
     ice: [ice(3750, 300), ice(4600, 320)],
     belts: [belt(4100, GROUND_Y, 240, -1, 130)],
-    // a latch plate lifts the steel barrier blocking the plate-gate slab
-    switches: [plate(4680, GROUND_Y, 0, 64, true)],
-    barriers: [barrier(4980, 120, 24, GROUND_Y - 120)],
+    // FIX: a hold-down plate now — you can't stand on it AND cross, so the crate
+    // is required to hold the door (it stops against the door on the plate); plus
+    // a lever-timed door to race on the icy gauntlet
+    boxes: [box(4700)],
+    switches: [weightPlate(4900, 0), lever(3750, 1, 3000)],
+    barriers: [
+      barrier(4980, 120, 24, GROUND_Y - 120),
+      barrier(3950, 120, 22, GROUND_Y - 120),
+    ],
     coins: [
       ...coinArc(300, 400, 3),
       { x: 1030, y: 320 },
@@ -819,6 +922,12 @@ export const LEVELS: Level[] = [
     ],
     droppers: [dropper(1300, 150), dropper(3850, 150), dropper(6400, 150)],
     wind: [wind(3130, 280, 520, 180, -110), wind(5040, 280, 460, 180, 110)],
+    // a short timed-laser maze woven through the spikes and gusts
+    lasers: [
+      laser(4000, 150, 10, 330, 1.6, 0, 0.45),
+      laser(4130, 150, 10, 330, 1.6, 0.5, 0.45),
+      laser(5250, 150, 10, 330, 1.7, 0.25, 0.45),
+    ],
     coins: [
       ...coinArc(300, 400, 3),
       { x: 2500, y: 320 },
@@ -876,6 +985,7 @@ export const LEVELS: Level[] = [
       ground(3430, 700), // crusher gauntlet, gap 150
       ground(4280, 700), // wind + crumble gauntlet, gap 150
       ground(5130, 700), // crate + plate-gate + rockfall, gap 150
+      block(5580, 130, 110, 20), // fan-lift bonus ledge (one-way)
       ground(5980, 1220), // gated summit base + climb
       block(6270, 380), // summit staircase (past the gate, 60px steps)
       block(6430, 320),
@@ -898,8 +1008,19 @@ export const LEVELS: Level[] = [
     wind: [wind(4280, 280, 700, 200, -110)],
     crumblers: [crumbler(4400, 372), crumbler(4650, 356)],
     boxes: [box(5150)],
-    switches: [plate(5300, GROUND_Y, 0, 64, true)],
-    barriers: [barrier(5540, 120, 24, GROUND_Y - 120)],
+    // finale puzzle-gauntlet: shove the crate onto the plate (it stops against
+    // the door) to open the door AND cut the laser past it; then an updraft over
+    // the rockfall; then a lever-timed door to race before the summit gate
+    switches: [weightPlate(5300, 0), lever(5790, 1, 2500)],
+    barriers: [
+      barrier(5350, 150, 22, 330),
+      barrier(5960, 120, 22, GROUND_Y - 120),
+    ],
+    lasers: [
+      laser(3700, 150, 10, 330, 1.6, 0, 0.5),
+      linkedLaser(5470, 150, 10, 330, 0),
+    ],
+    fans: [fan(5600, 140, 80, 300, 520)],
     droppers: [dropper(5720, 150)],
     coins: [
       { x: 300, y: 300 },
@@ -913,6 +1034,8 @@ export const LEVELS: Level[] = [
       { x: 4400, y: 344 },
       { x: 4650, y: 328 },
       { x: 5172, y: 400 },
+      { x: 5620, y: 108 }, // bonus coins on the fan-lift ledge
+      { x: 5660, y: 108 },
       ...coinRow(5620, 440, 2),
       { x: 6270, y: 344 },
       { x: 6430, y: 284 },

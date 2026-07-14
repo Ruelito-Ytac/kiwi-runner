@@ -7,9 +7,11 @@ import type {
   DifficultyConfig,
   Dropper,
   Enemy,
+  Fan,
   Flyer,
   Gate,
   Ice,
+  Laser,
   Level,
   MovingPlatform,
   PushBox,
@@ -511,8 +513,9 @@ type MoverState = MovingPlatform & {
 };
 type KeyItem = { x: number; y: number; taken: boolean };
 type BoxState = PushBox & { vy: number };
-type SwitchState = Switch & { latchedOn: boolean; active: boolean };
+type SwitchState = Switch & { latchedOn: boolean; active: boolean; until: number };
 type BarrierState = Barrier & { open: boolean };
+type LaserState = Laser & { on: boolean };
 type CrumblerState = Crumbler & {
   stage: "solid" | "shaking" | "gone";
   timer: number;
@@ -567,6 +570,8 @@ export class KiwiGame {
   private droppers: DropperState[] = [];
   private iceList: Ice[] = [];
   private windZones: Wind[] = [];
+  private lasers: LaserState[] = [];
+  private fans: Fan[] = [];
   private finish = { x: 0, y: 0 };
   private levelCoins = 0;
   private timeLeft: number | null = null;
@@ -896,6 +901,7 @@ export class KiwiGame {
       ...s,
       latchedOn: false,
       active: false,
+      until: 0,
     }));
     this.barriers = (lv.barriers ?? []).map((b) => ({ ...b, open: false }));
     this.crumblers = (lv.crumblers ?? []).map((c) => ({
@@ -920,6 +926,8 @@ export class KiwiGame {
     }));
     this.iceList = (lv.ice ?? []).map((i) => ({ ...i }));
     this.windZones = (lv.wind ?? []).map((w) => ({ ...w }));
+    this.lasers = (lv.lasers ?? []).map((l) => ({ ...l, on: false }));
+    this.fans = (lv.fans ?? []).map((f) => ({ ...f }));
     this.finish = { ...lv.finish };
     this.levelCoins = 0;
     this.timeLeft = this.diff.timeLimitSec;
@@ -1037,11 +1045,19 @@ export class KiwiGame {
 
       // gravity
       p.vy = Math.min(p.vy + GRAVITY * dt, MAX_FALL);
+      // updraft fans lift the kiwi up a shaft — overcome gravity, cap the rise
+      const lift = this.fanLift();
+      if (lift > 0) {
+        p.vy -= lift * dt * 3.2;
+        if (p.vy < -lift) p.vy = -lift;
+        p.onGround = false;
+      }
     }
 
     // moving platforms advance first and carry a rider along with them
     const wasOnGround = p.onGround;
     this.updateSwitches(); // set barriers open/closed before this frame's collisions
+    this.updateLasers(); // beams read the switch state we just set
     this.updateMovers();
     this.updateCrumblers(dt); // collapse timers → may remove a solid before we collide
     this.updateCrushers(); // advance slam cycles (position + lethal window)
@@ -1228,16 +1244,40 @@ export class KiwiGame {
   private updateSwitches() {
     const pr = this.playerRect();
     for (const bar of this.barriers) bar.open = false;
-    const on = (bx: number, bw: number, by: number, bh: number, s: Switch) =>
+    const onPlate = (bx: number, bw: number, by: number, bh: number, s: Switch) =>
       bx + bw > s.x && bx < s.x + s.w && by + bh >= s.y - 8 && by + bh <= s.y + 12;
     for (const s of this.switches) {
       const pressed =
-        on(pr.x, pr.w, pr.y, pr.h, s) ||
-        this.boxes.some((b) => on(b.x, b.w, b.y, b.h, s));
-      if (pressed) s.latchedOn = true;
-      s.active = s.latch ? s.latchedOn : pressed;
-      const bar = this.barriers[s.barrier];
+        s.mode === "lever"
+          ? aabb(pr, { x: s.x, y: s.y, w: s.w, h: s.h }) // a lever trips on touch
+          : onPlate(pr.x, pr.w, pr.y, pr.h, s) || // a plate needs weight underfoot
+            this.boxes.some((b) => onPlate(b.x, b.w, b.y, b.h, s));
+      if (pressed) {
+        s.latchedOn = true;
+        if (s.openMs) s.until = this.time + s.openMs / 1000; // (re)start the timer
+      }
+      // latch = permanent once tripped; openMs = timed door (stays open that long
+      // after each trip); otherwise a plain hold-down that follows the weight.
+      if (s.latch) s.active = s.latchedOn;
+      else if (s.openMs) s.active = this.time < s.until;
+      else s.active = pressed;
+      const bar = s.barrier != null ? this.barriers[s.barrier] : undefined;
       if (s.active && bar) bar.open = true;
+    }
+  }
+
+  /** Set each laser ON/OFF for this frame. Timed lasers cycle on `period`/`duty`;
+   *  switch-linked lasers are ON only while their switch is inactive (so parking a
+   *  crate on the plate, or throwing the lever, cuts the beam). */
+  private updateLasers() {
+    for (const l of this.lasers) {
+      if (l.link != null) {
+        l.on = !this.switches[l.link]?.active;
+      } else {
+        const period = l.period ?? 2;
+        const t = mod(this.time / period + (l.phase ?? 0), 1);
+        l.on = t < (l.duty ?? 0.5);
+      }
     }
   }
 
@@ -1335,6 +1375,19 @@ export class KiwiGame {
     return push;
   }
 
+  /** Upward lift (px/s) from any updraft column the kiwi's centre is inside. */
+  private fanLift(): number {
+    const p = this.player;
+    const cx = p.x + PLAYER.w / 2;
+    const cy = p.y + PLAYER.h / 2;
+    let lift = 0;
+    for (const f of this.fans) {
+      if (cx > f.x && cx < f.x + f.w && cy > f.y && cy < f.y + f.h)
+        lift = Math.max(lift, f.lift);
+    }
+    return lift;
+  }
+
   /** Topmost solid surface strictly below `fromY` in the column [x, x+w] — where
    *  a dropped rock shatters. DEATH_Y if nothing is below (it falls into a pit). */
   private surfaceUnder(x: number, w: number, fromY: number): number {
@@ -1362,6 +1415,7 @@ export class KiwiGame {
     for (const s of this.switches) {
       s.latchedOn = false;
       s.active = false;
+      s.until = 0;
     }
     for (const bar of this.barriers) bar.open = false;
   }
@@ -1503,6 +1557,13 @@ export class KiwiGame {
     for (const d of this.droppers) {
       if (d.stage !== "falling") continue;
       if (aabb(pr, { x: d.x + 4, y: d.curY + 4, w: d.w - 8, h: d.h - 6 }))
+        return this.startDeath(false);
+    }
+    for (const l of this.lasers) {
+      // lethal only while lit; a hair of forgiveness on the thin axis
+      if (!l.on) continue;
+      const inset = l.w >= l.h ? { x: 0, y: 2 } : { x: 2, y: 0 };
+      if (aabb(pr, { x: l.x + inset.x, y: l.y + inset.y, w: l.w - inset.x * 2, h: l.h - inset.y * 2 }))
         return this.startDeath(false);
     }
     return false;
@@ -1795,6 +1856,8 @@ export class KiwiGame {
     this.drawEnemies();
     this.drawFlyers();
     this.drawWind();
+    this.drawFans();
+    this.drawLasers();
     this.drawFinish();
     this.drawPlayer();
     this.drawEffects(); // jump dust / air burst in front of the kiwi
@@ -2368,6 +2431,80 @@ export class KiwiGame {
     }
   }
 
+  /** Updraft columns: a faint upward gradient with rising chevrons so a shaft
+   *  reads as "ride me up" before you step in. */
+  private drawFans() {
+    const ctx = this.ctx;
+    for (const f of this.fans) {
+      if (f.x + f.w < this.camX || f.x > this.camX + LOGICAL_W) continue;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(f.x, f.y, f.w, f.h);
+      ctx.clip();
+      const grad = ctx.createLinearGradient(0, f.y, 0, f.y + f.h);
+      grad.addColorStop(0, "rgba(150,220,255,0.02)");
+      grad.addColorStop(1, "rgba(150,220,255,0.16)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(f.x, f.y, f.w, f.h);
+      ctx.strokeStyle = "rgba(205,240,255,0.5)";
+      ctx.lineWidth = 2;
+      const spacing = 46;
+      const scroll = mod(this.time * 220, spacing);
+      const cols = Math.max(1, Math.round(f.w / 44));
+      for (let c = 0; c < cols; c++) {
+        const cx = f.x + (c + 0.5) * (f.w / cols);
+        for (let y = f.y + f.h + spacing - scroll; y > f.y - spacing; y -= spacing) {
+          ctx.beginPath();
+          ctx.moveTo(cx - 8, y + 8);
+          ctx.lineTo(cx, y);
+          ctx.lineTo(cx + 8, y + 8);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
+
+  /** Laser beams: a lethal red bar while lit; a faint line with a green pilot on
+   *  the emitters while charged down, so you can read where it fires. */
+  private drawLasers() {
+    const ctx = this.ctx;
+    for (const l of this.lasers) {
+      if (l.x + l.w < this.camX || l.x > this.camX + LOGICAL_W) continue;
+      const horiz = l.w >= l.h;
+      ctx.fillStyle = "#3a4048"; // emitter housings at both ends
+      if (horiz) {
+        ctx.fillRect(l.x - 7, l.y - 5, 7, l.h + 10);
+        ctx.fillRect(l.x + l.w, l.y - 5, 7, l.h + 10);
+      } else {
+        ctx.fillRect(l.x - 5, l.y - 7, l.w + 10, 7);
+        ctx.fillRect(l.x - 5, l.y + l.h, l.w + 10, 7);
+      }
+      if (l.on) {
+        ctx.fillStyle = "rgba(255,60,60,0.22)"; // outer glow
+        if (horiz) ctx.fillRect(l.x, l.y - 3, l.w, l.h + 6);
+        else ctx.fillRect(l.x - 3, l.y, l.w + 6, l.h);
+        ctx.fillStyle = "rgba(255,70,70,0.92)"; // beam body
+        ctx.fillRect(l.x, l.y, l.w, l.h);
+        const core = 0.6 + 0.4 * Math.abs(Math.sin(this.time * 22));
+        ctx.fillStyle = `rgba(255,235,235,${core})`; // pulsing core
+        if (horiz) ctx.fillRect(l.x, l.y + l.h / 2 - 1, l.w, 2);
+        else ctx.fillRect(l.x + l.w / 2 - 1, l.y, 2, l.h);
+      } else {
+        ctx.fillStyle = "rgba(255,120,120,0.14)"; // faint idle line
+        ctx.fillRect(l.x, l.y, l.w, l.h);
+        ctx.fillStyle = "rgba(120,255,120,0.6)"; // green "safe" pilot lights
+        if (horiz) {
+          ctx.fillRect(l.x - 5, l.y + l.h / 2 - 2, 3, 4);
+          ctx.fillRect(l.x + l.w + 2, l.y + l.h / 2 - 2, 3, 4);
+        } else {
+          ctx.fillRect(l.x + l.w / 2 - 2, l.y - 5, 4, 3);
+          ctx.fillRect(l.x + l.w / 2 - 2, l.y + l.h + 2, 4, 3);
+        }
+      }
+    }
+  }
+
   private drawKeys() {
     const ctx = this.ctx;
     for (const k of this.keyItems) {
@@ -2434,14 +2571,30 @@ export class KiwiGame {
     const ctx = this.ctx;
     for (const s of this.switches) {
       if (s.x + s.w < this.camX || s.x > this.camX + LOGICAL_W) continue;
+      if (s.mode === "lever") {
+        // a floor lever: post + handle that throws from red to green when active
+        const cx = s.x + s.w / 2;
+        ctx.fillStyle = "#3a4048";
+        ctx.fillRect(s.x, s.y + s.h - 6, s.w, 6); // mount
+        ctx.fillStyle = "#2b333a";
+        ctx.fillRect(cx - 4, s.y + 8, 8, s.h - 8); // post
+        ctx.save();
+        ctx.translate(cx, s.y + 14);
+        ctx.rotate(s.active ? 0.6 : -0.6); // handle swings when thrown
+        ctx.fillStyle = "#c9d1d9";
+        ctx.fillRect(-3, -16, 6, 18); // handle shaft
+        ctx.fillStyle = s.active ? "#39d98a" : "#e06a5a";
+        ctx.beginPath();
+        ctx.arc(0, -16, 6, 0, Math.PI * 2); // knob
+        ctx.fill();
+        ctx.restore();
+        continue;
+      }
       const down = s.active ? 4 : 0; // plate presses down when active
-      // base
-      ctx.fillStyle = "#33404a";
+      ctx.fillStyle = "#33404a"; // base
       ctx.fillRect(s.x, s.y - 4, s.w, s.h + 4);
-      // plate
-      ctx.fillStyle = s.active ? "#39d98a" : "#e06a5a";
+      ctx.fillStyle = s.active ? "#39d98a" : "#e06a5a"; // plate
       ctx.fillRect(s.x + 3, s.y - 10 + down, s.w - 6, 10 - down);
-      // a lever nub for latch switches, a flat plate otherwise
       ctx.fillStyle = "rgba(255,255,255,0.35)";
       ctx.fillRect(s.x + 3, s.y - 10 + down, s.w - 6, 2);
     }

@@ -114,13 +114,26 @@ describe("mechanic safety invariants", () => {
         );
   });
 
-  it("points every switch at a real barrier", () => {
+  it("points every switch at a real barrier (when it drives one)", () => {
     for (const lv of LEVELS)
       for (const s of lv.switches ?? [])
-        expect(
-          lv.barriers?.[s.barrier],
-          `L${lv.id} switch→barrier[${s.barrier}]`,
-        ).toBeDefined();
+        if (s.barrier != null)
+          expect(
+            lv.barriers?.[s.barrier],
+            `L${lv.id} switch→barrier[${s.barrier}]`,
+          ).toBeDefined();
+  });
+
+  it("wires every laser to a real switch or a passable cycle", () => {
+    for (const lv of LEVELS)
+      for (const l of lv.lasers ?? [])
+        if (l.link != null)
+          expect(
+            lv.switches?.[l.link],
+            `L${lv.id} laser@${l.x} link[${l.link}]`,
+          ).toBeDefined();
+        // timed laser: must have an OFF window to run through
+        else expect(l.duty ?? 0.5, `L${lv.id} laser@${l.x} duty`).toBeLessThan(1);
   });
 
   it("makes each level at least as long as the one before it", () => {
@@ -185,6 +198,11 @@ describe("mechanic safety invariants", () => {
         ...(lv.droppers ?? []).map((d) => ({
           what: `dropper@${d.x}`,
           box: { x: d.x, y: d.y, w: d.w, h: GROUND_Y - d.y },
+        })),
+        // a laser beam is lethal wherever its rect is (whenever it's lit)
+        ...(lv.lasers ?? []).map((l) => ({
+          what: `laser@${l.x}`,
+          box: { x: l.x, y: l.y, w: l.w, h: l.h },
         })),
       ];
       for (const c of items)
