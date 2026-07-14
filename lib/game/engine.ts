@@ -1678,8 +1678,8 @@ export class KiwiGame {
     this.drawFlyers();
     this.drawWind();
     this.drawFinish();
-    this.drawEffects();
     this.drawPlayer();
+    this.drawEffects(); // jump dust / air burst in front of the kiwi
     this.drawParticles();
     ctx.restore();
   }
