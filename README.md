@@ -17,6 +17,13 @@ pits, every level layers in **2–3 environment mechanics**:
   **wind gusts** (shove you mid-run and mid-jump)
 - **push-crates** and **pressure-plate → barrier** gates
 
+Mobs are **stomped Mario-style** (land on a head to defeat it — any other touch
+hurts), floating ledges are **jump-through** (leap up from below, land on top),
+dying plays a **pop-and-tumble death** with a feather burst, jumps kick up
+**dust / an air-burst effect**, and there's **sound + per-theme background
+music** and a **fullscreen toggle** (both in the HUD). The windowed view scales
+to fill most of the browser.
+
 Some finish flags sit at the **top** of a climb, not on the ground. Four
 difficulties from **Easy** to **Extreme** (1 life, 45s, double-speed mobs).
 
@@ -36,9 +43,10 @@ Other commands: `npm run build` / `npm run start` (production), `npm run test`
 ## Controls
 
 - **Desktop:** ← → or A/D to move, Space / ↑ / W to jump (hold for a higher
-  jump), Esc to pause.
-- **Touch:** on-screen left / right / jump buttons appear on coarse-pointer
-  devices.
+  jump), Shift / K to dash, Esc to pause. **Stomp** a mob by landing on its head;
+  **jump up through** floating ledges and land on top. 🔊 in the HUD mutes audio.
+- **Touch:** on-screen left / right / jump / dash buttons appear on
+  coarse-pointer devices.
 
 ## Flow
 
@@ -55,9 +63,11 @@ Other commands: `npm run build` / `npm run start` (production), `npm run test`
 | Shared data types | `lib/game/types.ts` |
 | Collision core (pure, unit-tested) | `lib/game/physics.ts` (+ `physics.test.ts`) |
 | Engine: loop, physics, animation, rendering | `lib/game/engine.ts` |
+| Audio: Web-Audio sfx + looping music | `lib/game/audio.ts` |
 | React shell: screens, HUD, input wiring | `app/_components/KiwiRunner.tsx` |
 | Route entry | `app/page.tsx` · `app/layout.tsx` |
 | Kiwi sprite sheet | `public/kiwi_animation.png` |
+| Sound effects + music (+ credits) | `public/audio/` |
 
 ## Adding a level
 
@@ -172,7 +182,27 @@ jump buffer), not by mutating level geometry.
 - **Coins, keys, springs, movers, spikes, enemies, flyers, the gate, and the
   finish flag** — plus every environment mechanic (crumblers, belts, crushers,
   droppers, ice, wind, crates, plates, barriers) — are drawn procedurally on the
-  canvas; no new art files were needed.
-- **Enemies, flyers, crushers, and falling rocks are pure hazards** (no
-  stomp-to-defeat) — contact costs a life. Easy/Medium respawn you at the level
-  start (coins/keys kept, other mechanics reset); Hard restarts the level.
+  canvas. The **jump VFX** are the only sprite-sheet effects: feet-anchored frame
+  sequences in `public/Jump/take_off` (ground-jump dust), `public/Jump/land`
+  (landing dust), and `public/Double Jump` (air-jump burst), loaded by
+  `loadFrames` and played once at the kiwi's feet. Missing frames → the effect
+  just doesn't draw.
+- **Display:** the game frame is the largest 16:9 that fits `min(94vw, 86vh·16/9)`
+  windowed, and the whole screen in fullscreen. `setupCanvas` sizes the canvas
+  backing store to the displayed pixels × dpr (capped at 2), so it stays crisp at
+  any size — and re-fits on resize / `fullscreenchange`. A **⛶ toggle** in the HUD
+  enters/exits fullscreen (standard Fullscreen API; unsupported browsers stay
+  windowed). In fullscreen the browser owns **Esc** (it exits fullscreen before it
+  can pause) — use the on-screen ⏸ button to pause.
+- **Enemies and flyers can be stomped** — land on the head while falling to
+  defeat them (a bounce + score); any other contact costs a life. **Spikes,
+  crushers, and falling rocks** are pure hazards (never stompable). A death plays
+  a short pop-and-tumble animation with a feather burst before the outcome:
+  Easy/Medium respawn you at the level start (coins/keys kept, mobs revived,
+  other mechanics reset); Hard restarts the level.
+- **Audio** (`lib/game/audio.ts`, Web Audio API): jump/coin/stomp/death SFX are
+  Kenney's **CC0** "Digital Audio" pack (real downloads); the six per-theme
+  background loops are **synthesized** for this project (see
+  `public/audio/CREDITS.txt`). The context is unlocked on the first Play click
+  (autoplay policy); a missing/blocked clip just plays silent. Swap in your own
+  tracks by dropping same-named files into `public/audio/`.

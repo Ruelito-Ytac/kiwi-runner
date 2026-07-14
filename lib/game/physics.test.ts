@@ -47,6 +47,37 @@ describe("moveAndCollide", () => {
   });
 });
 
+describe("one-way (jump-through) platforms", () => {
+  const oneWay: Rect = { x: 0, y: 100, w: 500, h: 10, oneWay: true };
+
+  it("catches a downward landing from above", () => {
+    const body: Rect = { x: 50, y: 60, w: 20, h: 30 }; // bottom 90, above the top
+    const r = moveAndCollide(body, 0, 30, [oneWay]);
+    expect(r.onGround).toBe(true);
+    expect(r.y).toBe(70); // rests with bottom on the platform top (100)
+  });
+
+  it("passes straight up through it (no head bonk)", () => {
+    const body: Rect = { x: 50, y: 120, w: 20, h: 20 }; // below the platform
+    const r = moveAndCollide(body, 0, -30, [oneWay]);
+    expect(r.hitHead).toBe(false);
+    expect(r.y).toBe(90); // moved freely up through it
+  });
+
+  it("does not block horizontal movement", () => {
+    const body: Rect = { x: -30, y: 100, w: 20, h: 20 }; // overlaps vertically
+    const r = moveAndCollide(body, 30, 0, [oneWay]);
+    expect(r.x).toBe(0); // slid through, not stopped at the edge
+  });
+
+  it("does not snap a body up when it is rising through and starts to fall", () => {
+    const body: Rect = { x: 50, y: 95, w: 20, h: 20 }; // straddling from below
+    const r = moveAndCollide(body, 0, 5, [oneWay]);
+    expect(r.onGround).toBe(false);
+    expect(r.y).toBe(100); // kept falling, not yanked onto the platform
+  });
+});
+
 describe("crusherOffset", () => {
   it("stays fully raised (0) for a contiguous window each cycle", () => {
     // The raised window is what guarantees a crusher is always passable.

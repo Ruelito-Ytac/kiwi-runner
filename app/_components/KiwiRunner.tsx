@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { AudioManager } from "@/lib/game/audio";
 import { DIFFICULTIES } from "@/lib/game/difficulty";
 import {
   KiwiGame,
@@ -14,6 +15,8 @@ import {
 } from "@/lib/game/engine";
 import { LEVELS } from "@/lib/game/levels";
 import type { Difficulty } from "@/lib/game/types";
+
+const MUTE_KEY = "kiwi-runner-muted";
 
 type Screen =
   | "loading"
@@ -41,13 +44,18 @@ const EMPTY_ASSETS: GameAssets = {
   floorMid: null,
   floorEnd: null,
   platform: null,
+  jumpTakeoff: [],
+  jumpLand: [],
+  doubleJump: [],
 };
 
 export function KiwiRunner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
   const gameRef = useRef<KiwiGame | null>(null);
   const spriteRef = useRef<KiwiSprite | null>(null);
   const assetsRef = useRef<GameAssets | null>(null);
+  const audioRef = useRef<AudioManager | null>(null);
   const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [screen, setScreen] = useState<Screen>("loading");
@@ -57,6 +65,12 @@ export function KiwiRunner() {
   const [hint, setHint] = useState<string | null>(null);
   const [confirmQuit, setConfirmQuit] = useState(false);
   const [locked, setLocked] = useState(false); // disables overlay buttons mid-transition
+  const [muted, setMuted] = useState(
+    () =>
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem(MUTE_KEY) === "1",
+  );
+  const [isFullscreen, setIsFullscreen] = useState(false);
   // Coarse pointer = touch device → show on-screen controls. Read lazily so it
   // is correct on first client render without a setState-in-effect.
   const [isTouch] = useState(
@@ -77,6 +91,7 @@ export function KiwiRunner() {
     return () => {
       alive = false;
       gameRef.current?.destroy();
+      audioRef.current?.stopMusic();
       if (hintTimer.current) clearTimeout(hintTimer.current);
     };
   }, []);
@@ -111,6 +126,10 @@ export function KiwiRunner() {
       const canvas = canvasRef.current;
       if (!canvas) return;
       gameRef.current?.destroy();
+      // Unlock + preload audio inside this click gesture (browser autoplay rule).
+      if (!audioRef.current) audioRef.current = new AudioManager();
+      audioRef.current.setMuted(muted);
+      void audioRef.current.init();
       const game = new KiwiGame(
         canvas,
         spriteRef.current,
@@ -122,6 +141,7 @@ export function KiwiRunner() {
           onOutcome: showOutcome,
           onHint: showHint,
           onPauseRequest: requestPause,
+          onSfx: (name) => audioRef.current?.sfx(name),
         },
       );
       gameRef.current = game;
@@ -138,7 +158,7 @@ export function KiwiRunner() {
         setScreen("playing");
       }
     },
-    [showOutcome, showHint, requestPause],
+    [showOutcome, showHint, requestPause, muted],
   );
 
   const dismissControls = () => {
@@ -153,10 +173,24 @@ export function KiwiRunner() {
     setScreen("playing");
   }, []);
 
+  // Fullscreen the game frame (must be called inside a click gesture).
+  const exitFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  };
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      exitFullscreen();
+    } else {
+      const el = frameRef.current;
+      el?.requestFullscreen?.().catch(() => {}); // unsupported / denied → stay windowed
+    }
+  };
+
   const quitToMenu = () => {
     gameRef.current?.destroy();
     gameRef.current = null;
     setConfirmQuit(false);
+    exitFullscreen();
     setScreen("menu");
   };
 
@@ -189,6 +223,43 @@ export function KiwiRunner() {
     return () => window.removeEventListener("keydown", onKey);
   }, [screen, confirmQuit, resume]);
 
+  /* ---- audio: per-level music + pause, driven by the current screen ---- */
+  const level = hud?.level;
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.setMuted(muted);
+    if (screen === "playing") {
+      audio.resume();
+      const theme =
+        level != null ? LEVELS.find((l) => l.id === level)?.theme : undefined;
+      if (theme) audio.music(theme);
+    } else if (screen === "paused" || screen === "controls") {
+      audio.pause(); // hold music silent under the overlay, keep its position
+    } else if (screen !== "levelComplete") {
+      // menu / difficulty / gameOver / victory / loading — stop the music
+      audio.stopMusic();
+      audio.resume();
+    }
+  }, [screen, level, muted]);
+
+  const toggleMute = useCallback(() => {
+    setMuted((m) => {
+      const next = !m;
+      audioRef.current?.setMuted(next);
+      if (typeof localStorage !== "undefined")
+        localStorage.setItem(MUTE_KEY, next ? "1" : "0");
+      return next;
+    });
+  }, []);
+
+  /* ---- track fullscreen so the toggle button shows the right icon ---- */
+  useEffect(() => {
+    const onFs = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onFs);
+    return () => document.removeEventListener("fullscreenchange", onFs);
+  }, []);
+
   /* ---- touch button helpers ---- */
   const move = (dir: "left" | "right", on: boolean) =>
     gameRef.current?.setMove(dir, on);
@@ -200,18 +271,30 @@ export function KiwiRunner() {
     screen === "playing" || screen === "paused" || screen === "controls";
 
   return (
-    <div className="flex min-h-dvh w-full items-center justify-center bg-gradient-to-b from-sky-300 to-emerald-200 p-4">
-      <div className="w-full max-w-[960px]">
-        <div className="relative aspect-video w-full overflow-hidden rounded-2xl border-4 border-white/70 bg-sky-200 shadow-2xl">
-          {/* the game itself */}
-          <canvas
-            ref={canvasRef}
-            className="absolute inset-0 h-full w-full"
-            aria-label="Kiwi Runner game canvas"
-          />
+    <div className="flex min-h-dvh w-full flex-col items-center justify-center gap-3 bg-gradient-to-b from-sky-300 to-emerald-200 p-3">
+      <div
+        ref={frameRef}
+        className="relative aspect-video w-[min(94vw,calc(86vh*16/9))] overflow-hidden rounded-2xl border-4 border-white/70 bg-sky-200 shadow-2xl [&:fullscreen]:aspect-auto [&:fullscreen]:h-screen [&:fullscreen]:w-screen [&:fullscreen]:rounded-none [&:fullscreen]:border-0 [&:fullscreen]:bg-black"
+      >
+        {/* game canvas — the engine keeps it a centred 16:9 box (letterboxes on
+            black in fullscreen); its CSS size is set in setupCanvas */}
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 m-auto"
+          aria-label="Kiwi Runner game canvas"
+        />
 
           {/* HUD */}
-          {playing && hud && <Hud hud={hud} onPause={requestPause} />}
+          {playing && hud && (
+            <Hud
+              hud={hud}
+              muted={muted}
+              isFullscreen={isFullscreen}
+              onPause={requestPause}
+              onToggleMute={toggleMute}
+              onToggleFullscreen={toggleFullscreen}
+            />
+          )}
 
           {/* transient hint (min-coin gate, etc.) */}
           {hint && screen === "playing" && (
@@ -301,7 +384,9 @@ export function KiwiRunner() {
                 <li>← → or A D — move</li>
                 <li>Space / ↑ / W — jump (hold higher, tap again to double-jump)</li>
                 <li>Shift / K — dash (a burst across gaps)</li>
-                <li>Esc — pause</li>
+                <li>Jump on a mob&apos;s head to stomp it — any other touch hurts</li>
+                <li>Leap up through floating ledges; land on top</li>
+                <li>Esc — pause · 🔊 mute · ⛶ fullscreen</li>
                 {isTouch && <li>On-screen buttons on touch devices</li>}
               </ul>
               <GameButton className="mt-6" onClick={dismissControls}>
@@ -400,19 +485,33 @@ export function KiwiRunner() {
               </GameButton>
             </Overlay>
           )}
-        </div>
-
-        <p className="mt-3 text-center text-sm text-emerald-900/70">
-          Desktop: arrows / WASD to move, Space to jump, Esc to pause.
-        </p>
       </div>
+
+      <p className="text-center text-sm text-emerald-900/70">
+        Desktop: arrows / WASD to move, Space to jump, Esc to pause. Use the ⛶
+        button in the HUD for fullscreen.
+      </p>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ pieces */
 
-function Hud({ hud, onPause }: { hud: HudState; onPause: () => void }) {
+function Hud({
+  hud,
+  muted,
+  isFullscreen,
+  onPause,
+  onToggleMute,
+  onToggleFullscreen,
+}: {
+  hud: HudState;
+  muted: boolean;
+  isFullscreen: boolean;
+  onPause: () => void;
+  onToggleMute: () => void;
+  onToggleFullscreen: () => void;
+}) {
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-3 text-sm font-bold text-white">
       <div className="flex flex-col gap-1 rounded-lg bg-black/40 px-3 py-1.5">
@@ -446,6 +545,22 @@ function Hud({ hud, onPause }: { hud: HudState; onPause: () => void }) {
             ⏱️ {hud.timeLeft}
           </span>
         )}
+        <button
+          onClick={onToggleMute}
+          className="pointer-events-auto rounded-lg bg-black/40 px-3 py-1.5 hover:bg-black/60 focus-visible:ring-2 focus-visible:ring-white"
+          aria-label={muted ? "Unmute" : "Mute"}
+          aria-pressed={muted}
+        >
+          {muted ? "🔇" : "🔊"}
+        </button>
+        <button
+          onClick={onToggleFullscreen}
+          className="pointer-events-auto rounded-lg bg-black/40 px-3 py-1.5 hover:bg-black/60 focus-visible:ring-2 focus-visible:ring-white"
+          aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          aria-pressed={isFullscreen}
+        >
+          {isFullscreen ? "🗗" : "⛶"}
+        </button>
         <button
           onClick={onPause}
           className="pointer-events-auto rounded-lg bg-black/40 px-3 py-1.5 hover:bg-black/60 focus-visible:ring-2 focus-visible:ring-white"
