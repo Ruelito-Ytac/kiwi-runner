@@ -176,9 +176,13 @@ jump buffer), not by mutating level geometry.
   (near-white → transparent) at load and inset-sampled to trim the dashed export
   border baked into the PNG. If the image fails to load, the game falls back to a
   drawn brown blob and still runs.
-- **Backgrounds** are all generated procedurally in code (gradient sky + two
-  parallax hill layers + theme extras — sun/moon, stars at night, drifting snow,
-  a sunless cave) — no background image files were supplied, so none are shipped.
+- **Backgrounds** are mostly procedural (gradient sky + two parallax hill layers
+  + theme extras — sun/moon, stars at night, drifting snow, a sunless cave), now
+  with **tree sprites** tiled into the parallax: blue `Background tree_*` in the
+  far layer, green `Middle Ground tree_*` in the middle layer (skipped on the cave
+  theme). The `_03` solid fill tiles aren't used — the themed hill bands provide
+  the colour fill so every theme stays coherent; trees draw in their native
+  colours (tint them to `pal.far`/`pal.near` if dark themes need it).
 - **Coins, keys, springs, movers, spikes, enemies, flyers, the gate, and the
   finish flag** — plus every environment mechanic (crumblers, belts, crushers,
   droppers, ice, wind, crates, plates, barriers) — are drawn procedurally on the

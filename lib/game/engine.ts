@@ -23,6 +23,7 @@ import type {
 
 const LOGICAL_W = 960;
 const LOGICAL_H = 540;
+const MAX_BACKING_W = 2560; // cap the canvas backing width (perf on big displays)
 
 const GRAVITY = 2000; // px/s^2
 const MOVE_SPEED = 240; // px/s, before playerSpeedMul
@@ -298,7 +299,33 @@ export type GameAssets = {
   jumpTakeoff: HTMLImageElement[]; // ground-jump dust (Jump/take_off)
   jumpLand: HTMLImageElement[]; // landing dust (Jump/land)
   doubleJump: HTMLImageElement[]; // air-jump burst (Double Jump)
+  drySoil: HTMLImageElement | null; // crumbler / destructable platform art
+  bgTrees: HTMLImageElement[]; // far-background tree silhouettes
+  midTrees: HTMLImageElement[]; // middle-ground trees
+  // flyer art — a 4-frame wing-flap sheet, pre-scaled under the GPU texture limit
+  batSprite: HTMLImageElement | HTMLCanvasElement | null;
+  ratWalk: HTMLImageElement | HTMLCanvasElement | null; // 3-frame rat walk sheet (pre-scaled)
+  deadKiwi: HTMLImageElement | null; // game-over kiwi, shown tumbling during the death
 };
+
+/** Downscale an image to at most `maxW` wide (keeping aspect) so it fits under
+ *  the GPU texture limit and samples cheaply every frame. Returns the original if
+ *  already small enough, else a canvas (also a valid drawImage source). */
+function downscale(
+  img: HTMLImageElement,
+  maxW: number,
+): HTMLImageElement | HTMLCanvasElement {
+  if (img.width <= maxW) return img;
+  const scale = maxW / img.width;
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(img.width * scale));
+  c.height = Math.max(1, Math.round(img.height * scale));
+  const g = c.getContext("2d");
+  if (!g) return img;
+  g.imageSmoothingQuality = "high";
+  g.drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
 
 function loadImage(src: string): Promise<HTMLImageElement | null> {
   return new Promise((resolve) => {
@@ -376,6 +403,12 @@ export async function loadAssets(): Promise<GameAssets> {
     jumpTakeoff,
     jumpLand,
     doubleJump,
+    drySoil,
+    bgTrees,
+    midTrees,
+    batSprite,
+    ratWalk,
+    deadKiwi,
   ] = await Promise.all([
     loadIdleSprite(),
     loadImage("/Cloud_Big.png"),
@@ -388,6 +421,12 @@ export async function loadAssets(): Promise<GameAssets> {
     loadFrames("/Jump/take_off/take_off_", 7),
     loadFrames("/Jump/land/land_", 8),
     loadFrames("/Double Jump/", 4),
+    loadImage("/Platform_Dry Soil.png"),
+    loadFrames("/Background tree_", 2), // blue far trees (01/02)
+    loadFrames("/Middle Ground tree_", 2), // green trees (01/02)
+    loadImage("/Bat_Sprite.png"),
+    loadImage("/rat_sprite.png"),
+    loadImage("/Game over-Kiwi.png"),
   ]);
   return {
     idle,
@@ -401,6 +440,12 @@ export async function loadAssets(): Promise<GameAssets> {
     jumpTakeoff,
     jumpLand,
     doubleJump,
+    drySoil,
+    bgTrees,
+    midTrees,
+    batSprite: batSprite ? downscale(batSprite, 1024) : null,
+    ratWalk: ratWalk ? downscale(ratWalk, 1536) : null,
+    deadKiwi,
   };
 }
 
@@ -542,6 +587,12 @@ export class KiwiGame {
   private lastHud = "";
 
   private input = { left: false, right: false };
+  // cheat codes typed while playing (persist across levels until quit)
+  private cheatBuf = "";
+  private cheatInvincible = false;
+  private cheatUnlimitedLives = false;
+  private cheatUnlimitedJump = false;
+  private cheatUnlimitedDash = false;
   private keyHandler: (e: KeyboardEvent) => void;
   private keyUpHandler: (e: KeyboardEvent) => void;
   private resizeHandler: () => void;
@@ -599,8 +650,16 @@ export class KiwiGame {
     }
     canvas.style.width = `${cssW}px`;
     canvas.style.height = `${cssH}px`;
-    canvas.width = Math.max(1, Math.round(cssW * dpr));
-    canvas.height = Math.max(1, Math.round(cssH * dpr));
+    // Backing = displayed size × dpr, but capped so huge/retina displays don't
+    // tank the fill-rate (crisp enough for cartoon art; big perf win when large).
+    let bw = cssW * dpr;
+    let bh = cssH * dpr;
+    if (bw > MAX_BACKING_W) {
+      bh *= MAX_BACKING_W / bw;
+      bw = MAX_BACKING_W;
+    }
+    canvas.width = Math.max(1, Math.round(bw));
+    canvas.height = Math.max(1, Math.round(bh));
     this.ctx.setTransform(
       canvas.width / LOGICAL_W,
       0,
@@ -674,8 +733,10 @@ export class KiwiGame {
    *  airtime; on the ground it's limited only by the cooldown. */
   dashDown() {
     const p = this.player;
-    if (p.dashCd > 0 || p.dashTime > 0) return;
-    if (!p.onGround && p.dashAir) return;
+    if (p.dashTime > 0) return; // can't restart mid-dash
+    // ud88: unlimited dash skips the cooldown + one-air-dash limits
+    if (!this.cheatUnlimitedDash && (p.dashCd > 0 || (!p.onGround && p.dashAir)))
+      return;
     p.dashTime = DASH_TIME;
     p.dashDir = p.facing;
     p.dashCd = DASH_CD;
@@ -684,6 +745,7 @@ export class KiwiGame {
 
   private onKeyDown(e: KeyboardEvent) {
     if (this.status !== "playing" || !this.running) return;
+    this.checkCheat(e);
     switch (e.code) {
       case "ArrowLeft":
       case "KeyA":
@@ -730,6 +792,57 @@ export class KiwiGame {
       default:
         break;
     }
+  }
+
+  /* --------------------------------------------------------------- cheats */
+
+  /** Roll the typed characters into a small buffer and fire a cheat when a code
+   *  lands. Runs alongside the normal controls, so movement keys still work. */
+  private checkCheat(e: KeyboardEvent) {
+    if (e.repeat || e.key.length !== 1) return; // printable single chars, no auto-repeat
+    this.cheatBuf = (this.cheatBuf + e.key.toLowerCase()).slice(-6);
+    if (this.cheatBuf.endsWith("mcg88")) {
+      this.magnetCoins();
+      this.cheatBuf = "";
+    } else if (this.cheatBuf.endsWith("wyd88")) {
+      this.cheatInvincible = !this.cheatInvincible;
+      this.cb.onHint(`Cheat: invincible ${this.cheatInvincible ? "ON" : "OFF"}`);
+      this.cheatBuf = "";
+    } else if (this.cheatBuf.endsWith("uh88")) {
+      this.cheatUnlimitedLives = !this.cheatUnlimitedLives;
+      this.cb.onHint(
+        `Cheat: unlimited hearts ${this.cheatUnlimitedLives ? "ON" : "OFF"}`,
+      );
+      this.cheatBuf = "";
+    } else if (this.cheatBuf.endsWith("uj88")) {
+      this.cheatUnlimitedJump = !this.cheatUnlimitedJump;
+      this.cb.onHint(
+        `Cheat: unlimited jump ${this.cheatUnlimitedJump ? "ON" : "OFF"}`,
+      );
+      this.cheatBuf = "";
+    } else if (this.cheatBuf.endsWith("ud88")) {
+      this.cheatUnlimitedDash = !this.cheatUnlimitedDash;
+      this.cb.onHint(
+        `Cheat: unlimited dash ${this.cheatUnlimitedDash ? "ON" : "OFF"}`,
+      );
+      this.cheatBuf = "";
+    }
+  }
+
+  /** Instantly collect every remaining coin in the level. */
+  private magnetCoins() {
+    let got = 0;
+    for (const c of this.coinList) {
+      if (c.collected) continue;
+      c.collected = true;
+      this.levelCoins++;
+      this.coins++;
+      this.score += COIN_VALUE;
+      got++;
+    }
+    if (got > 0) this.cb.onSfx?.("coin");
+    this.cb.onHint(`Cheat: +${got} coins magnetized!`);
+    this.pushHud(true);
   }
 
   /* ---------------------------------------------------------- level build */
@@ -909,7 +1022,11 @@ export class KiwiGame {
           FX_TAKEOFF_DUR,
           "bottom",
         );
-      } else if (p.jumpBuffer > 0 && !p.onGround && p.airJumpsLeft > 0) {
+      } else if (
+        p.jumpBuffer > 0 &&
+        !p.onGround &&
+        (p.airJumpsLeft > 0 || this.cheatUnlimitedJump) // uj88: jump forever
+      ) {
         p.vy = JUMP_VELOCITY; // double jump — crisp reset of vertical velocity
         p.airJumpsLeft--;
         p.jumpBuffer = 0;
@@ -1352,9 +1469,10 @@ export class KiwiGame {
   /** @returns true if the step should bail — a hit started the death sequence. */
   private checkHazards(): boolean {
     const p = this.player;
-    // pit
+    // pit (a fall still ends you even while invincible — avoid the gaps)
     if (p.y > DEATH_Y) return this.startDeath(true);
     if (p.invuln > 0) return false;
+    if (this.cheatInvincible) return false; // wyd88: no contact damage from mobs/hazards
 
     const pr = this.playerRect();
     for (const s of this.spikes) {
@@ -1414,7 +1532,7 @@ export class KiwiGame {
    *  pit fall). @returns true so `checkHazards` bails the rest of the step. */
   private startDeath(isPit: boolean): boolean {
     if (this.deathT > 0) return true; // already dying
-    this.lives--;
+    if (!this.cheatUnlimitedLives) this.lives--; // uh88: hearts never run out
     this.cb.onSfx?.("death");
     this.emitDeathBurst();
     this.deathHop = !isPit;
@@ -1732,9 +1850,9 @@ export class KiwiGame {
       }
     }
 
-    // two parallax hill layers; bands fill down so pits show scenery, not black
-    this.hills(pal.far, 360, 90, 300, 0.2);
-    this.hills(pal.near, 415, 120, 360, 0.45);
+    // layered forest: blue trees behind → green grass ground → green trees in
+    // front. Skipped underground (cave).
+    if (this.level.theme !== "cave") this.drawForest();
 
     // drifting snow (front of the hills, behind the world)
     if (pal.snow) {
@@ -1748,22 +1866,57 @@ export class KiwiGame {
     }
   }
 
-  private hills(
-    color: string,
-    baseY: number,
-    r: number,
-    spacing: number,
-    factor: number,
-  ) {
+  /** The layered forest background (matches the reference): a row of blue trees
+   *  behind, a green grass ground band whose top edge hides their bases, and a
+   *  row of green trees in front. Pits reveal the grass band, not the sky. */
+  private drawForest() {
     const ctx = this.ctx;
-    ctx.fillStyle = color;
-    const off = mod(this.camX * factor, spacing);
-    for (let x = -off - spacing; x < LOGICAL_W + spacing; x += spacing) {
-      ctx.beginPath();
-      ctx.arc(x + spacing / 2, baseY, r, Math.PI, 0);
-      ctx.fill();
+    const mid = this.assets.midTrees;
+    const grassTop = 478;
+
+    // far blue trees — same size as the green, offset a quarter-step to the RIGHT
+    // so they sit between the green trees (not aligned); set low
+    this.drawTreeRow(this.assets.bgTrees, 540, 268, 0.45, 8, 0.25);
+
+    // green grass ground: a solid grass fill from the grass line to the bottom,
+    // so the forest floor fills the pits (no sky gap)
+    ctx.fillStyle = "#6aa63f";
+    ctx.fillRect(0, grassTop, LOGICAL_W, LOGICAL_H - grassTop);
+
+    // near green trees — a continuous row in front
+    this.drawTreeRow(mid, 548, 268, 0.45, 8);
+  }
+
+  /** Tile a CONTINUOUS row of trees (uses `images[0..1]`, alternating; ignores any
+   *  fill tile), all the same `sizeH` tall with bases at `baselineY`. Trees are
+   *  placed edge-to-edge with `overlap` px of overlap so there are never gaps.
+   *  Only the on-screen tiles are drawn. */
+  private drawTreeRow(
+    images: HTMLImageElement[],
+    baselineY: number,
+    sizeH: number,
+    factor: number,
+    overlap: number,
+    phaseFrac = 0, // 0..1 of a pattern to shift by (0.5 centres a row between another)
+  ) {
+    const trees = images.slice(0, 2).filter((t): t is HTMLImageElement => !!t);
+    if (trees.length === 0) return;
+    const ctx = this.ctx;
+    const scroll = this.camX * factor;
+    const widths = trees.map((img) => sizeH * (img.width / img.height));
+    // one pattern = each variant once, laid end-to-end with the overlaps removed
+    const period = widths.reduce((a, b) => a + b, 0) - overlap * trees.length;
+    if (period <= 0) return;
+    const shift = phaseFrac * period;
+    const firstP = Math.floor((scroll - shift) / period) - 1;
+    const lastP = Math.floor((scroll - shift + LOGICAL_W) / period) + 1;
+    for (let p = firstP; p <= lastP; p++) {
+      let x = p * period - scroll + shift;
+      for (let i = 0; i < trees.length; i++) {
+        ctx.drawImage(trees[i]!, x, baselineY - sizeH, widths[i]!, sizeH);
+        x += widths[i]! - overlap;
+      }
     }
-    ctx.fillRect(0, baseY, LOGICAL_W, LOGICAL_H - baseY);
   }
 
   private drawPlatforms(pal: Palette) {
@@ -1874,16 +2027,36 @@ export class KiwiGame {
 
   private drawEnemies() {
     const ctx = this.ctx;
+    const walk = this.assets.ratWalk; // animated 3-frame rat sheet
     for (const e of this.enemies) {
       if (e.dead) continue;
       const bob = Math.sin(this.time * 6 + e.originX) * 2;
       const cx = e.x + e.w / 2;
+      if (walk) {
+        // Rat art faces LEFT; flip to face the walk direction. 3-frame walk cycle,
+        // per-rat phase so a pack doesn't step in sync.
+        const frames = 3;
+        const sw = walk.width / frames;
+        const sh = walk.height;
+        const frame = mod(Math.floor(this.time * 8 + e.originX * 0.2), frames);
+        const w = e.w * 2.0;
+        const h = w * (sh / sw);
+        // the walk sheet's feet sit at ~81% down the frame (measured) — drop it
+        // so the rat stands ON the ground instead of floating above it
+        const footDrop = h * 0.19;
+        ctx.save();
+        ctx.translate(cx, e.y + e.h + bob + footDrop);
+        if (e.dir > 0) ctx.scale(-1, 1); // moving right → mirror
+        ctx.drawImage(walk, frame * sw, 0, sw, sh, -w / 2, -h, w, h);
+        ctx.restore();
+        continue;
+      }
+      // procedural fallback: a red blob with eyes looking the way it walks
       const cy = e.y + e.h / 2 + bob;
       ctx.fillStyle = "#c0392b";
       ctx.beginPath();
       ctx.arc(cx, cy, e.w / 2, 0, Math.PI * 2);
       ctx.fill();
-      // eyes look the way it walks
       ctx.fillStyle = "#fff";
       const ex = cx + e.dir * 6;
       ctx.beginPath();
@@ -1900,13 +2073,35 @@ export class KiwiGame {
 
   private drawFlyers() {
     const ctx = this.ctx;
+    const bat = this.assets.batSprite;
     for (const f of this.flyers) {
       if (f.dead) continue;
       if (f.x + f.w < this.camX || f.x > this.camX + LOGICAL_W) continue;
       const cx = f.x + f.w / 2;
       const cy = f.y + f.h / 2;
+      if (bat) {
+        // 4-frame wing-flap sheet; front-facing (no flip), phase-offset per
+        // flyer so a swarm isn't in lock-step. Drawn wider than the hitbox so
+        // the wings spread past it.
+        const fw = bat.width / 4;
+        const frame = mod(Math.floor(this.time * 9 + f.originX * 0.3), 4);
+        const dw = f.w * 1.7;
+        const dh = dw * (bat.height / fw);
+        ctx.drawImage(
+          bat,
+          frame * fw,
+          0,
+          fw,
+          bat.height,
+          cx - dw / 2,
+          cy - dh / 2,
+          dw,
+          dh,
+        );
+        continue;
+      }
+      // procedural fallback: a purple bat-ish flapper
       const flap = Math.sin(this.time * 12 + f.originX) * 0.5;
-      // wings
       ctx.fillStyle = "#4834b0";
       for (const dir of [-1, 1]) {
         ctx.beginPath();
@@ -1916,12 +2111,10 @@ export class KiwiGame {
         ctx.closePath();
         ctx.fill();
       }
-      // body
       ctx.fillStyle = "#6c5ce7";
       ctx.beginPath();
       ctx.arc(cx, cy, f.h / 2 - 2, 0, Math.PI * 2);
       ctx.fill();
-      // eyes
       ctx.fillStyle = "#fff";
       ctx.beginPath();
       ctx.arc(cx - 4, cy - 2, 3, 0, Math.PI * 2);
@@ -2037,30 +2230,39 @@ export class KiwiGame {
     }
   }
 
-  /** Crumbling blocks: earthy and cracked, jittering while shaking, gone once
-   *  they drop. */
+  /** Crumbling blocks: the cracked dry-soil slab, jittering while shaking, gone
+   *  once it drops. Its top edge is the walk surface (`c.y`). */
   private drawCrumblers() {
     const ctx = this.ctx;
+    const img = this.assets.drySoil;
     for (const c of this.crumblers) {
       if (c.stage === "gone") continue;
       if (c.x + c.w < this.camX || c.x > this.camX + LOGICAL_W) continue;
       const shake = c.stage === "shaking" ? Math.sin(this.time * 60) * 2 : 0;
       ctx.save();
-      ctx.translate(shake, 0);
-      ctx.fillStyle = "#8a6a4a";
-      ctx.fillRect(c.x, c.y, c.w, c.h);
-      ctx.fillStyle = "#6f5238";
-      ctx.fillRect(c.x, c.y, c.w, 5);
-      ctx.strokeStyle = "rgba(30,20,10,0.6)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(c.x + c.w * 0.3, c.y);
-      ctx.lineTo(c.x + c.w * 0.42, c.y + c.h);
-      ctx.moveTo(c.x + c.w * 0.72, c.y);
-      ctx.lineTo(c.x + c.w * 0.6, c.y + c.h);
-      ctx.moveTo(c.x + c.w * 0.5, c.y + c.h * 0.45);
-      ctx.lineTo(c.x + c.w * 0.5, c.y + c.h);
-      ctx.stroke();
+      ctx.translate(c.x + shake, c.y);
+      if (img) {
+        // draw at natural aspect from the surface down; a hair wider than the
+        // hitbox so the chunky soil reads as a real ledge
+        const h = c.w * (img.height / img.width);
+        ctx.drawImage(img, 0, 0, c.w, h);
+      } else {
+        // procedural fallback: an earthy cracked block
+        ctx.fillStyle = "#8a6a4a";
+        ctx.fillRect(0, 0, c.w, c.h);
+        ctx.fillStyle = "#6f5238";
+        ctx.fillRect(0, 0, c.w, 5);
+        ctx.strokeStyle = "rgba(30,20,10,0.6)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(c.w * 0.3, 0);
+        ctx.lineTo(c.w * 0.42, c.h);
+        ctx.moveTo(c.w * 0.72, 0);
+        ctx.lineTo(c.w * 0.6, c.h);
+        ctx.moveTo(c.w * 0.5, c.h * 0.45);
+        ctx.lineTo(c.w * 0.5, c.h);
+        ctx.stroke();
+      }
       ctx.restore();
     }
   }
@@ -2287,6 +2489,21 @@ export class KiwiGame {
     const ctx = this.ctx;
     const p = this.player;
 
+    // DEATH: the game-over kiwi, spinning around its OWN CENTRE as it pops up and
+    // tumbles (rotating around the feet just made it swing, not spin).
+    if (this.deathT > 0 && this.assets.deadKiwi) {
+      const img = this.assets.deadKiwi;
+      const dh = DRAW_H * 1.15;
+      const dw = dh * (img.width / img.height);
+      const spin = (DEATH_TIME - this.deathT) * 13; // ~2 full rotations over the death
+      ctx.save();
+      ctx.translate(p.x + PLAYER.w / 2, p.y + PLAYER.h / 2);
+      ctx.rotate(spin);
+      ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+      ctx.restore();
+      return;
+    }
+
     // blink while invulnerable
     if (p.invuln > 0 && Math.floor(this.time * 20) % 2 === 0) return;
 
@@ -2300,7 +2517,8 @@ export class KiwiGame {
       tilt = clamp(p.vy * 0.0004, -0.22, 0.22);
     } else if (Math.abs(p.vx) > 5) {
       const fps = Math.min(18, 8 + Math.abs(p.vx) / 22);
-      frame = Math.floor(p.animTime * fps) % SHEET.frames;
+      // play the run cycle in reverse: 0→7 read as a backwards (moonwalk) gait
+      frame = SHEET.frames - 1 - (Math.floor(p.animTime * fps) % SHEET.frames);
     } else {
       frame = 0;
       bob = -Math.abs(Math.sin(this.time * 3)) * 3; // idle breathing
